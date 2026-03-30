@@ -174,20 +174,27 @@ class MainWindow(QMainWindow):
         assignments = self.engine.build_assignments(
             instances, global_sigs, self._promoted_ports,
         )
-        self.connection_view.load_assignments(
-            assignments,
-            promoted_ports=self._promoted_ports,
-            global_signals=global_sigs,
-        )
+        self.connection_view.load_assignments(assignments)
         self.connection_view.load_parameters(instances)
         self._update_buttons(True)
+
+        # Count diagnostics for status bar
         n_params = sum(len(i.params) for i in instances)
-        n_promoted = len(self._promoted_ports)
-        self.status_bar.showMessage(
-            f"Auto-connected {len(instances)} instance(s), "
-            f"{len(assignments)} port(s), {n_params} parameter(s), "
-            f"{n_promoted} promoted."
-        )
+        warnings = sum(1 for a in assignments if a.status and any(
+            tag in a.status for tag in ("Multi-Driver", "Undriven", "Conflict", "Width Mismatch")
+        ))
+        suggested = sum(1 for a in assignments if "Suggested" in a.status)
+        parts = [
+            f"{len(instances)} instance(s)",
+            f"{len(assignments)} port(s)",
+        ]
+        if n_params:
+            parts.append(f"{n_params} param(s)")
+        if suggested:
+            parts.append(f"{suggested} suggested")
+        if warnings:
+            parts.append(f"{warnings} warning(s)")
+        self.status_bar.showMessage("Auto-connected: " + ", ".join(parts) + ".")
 
     def _apply_edited_params(self, instances: list[InstanceInfo]):
         """Read parameter edits from the table and apply to instances."""

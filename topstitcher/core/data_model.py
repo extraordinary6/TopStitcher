@@ -77,6 +77,7 @@ class PortAssignment:
     msb_expr: str
     lsb_expr: str
     assigned_net: str  # editable by user
+    status: str = ""   # e.g. "Global", "Promoted", "Suggested", "Width Mismatch", etc.
 
     @property
     def range_str(self) -> str:

@@ -1,14 +1,18 @@
-"""Interactive connection table + parameter editor (V3)."""
+"""Interactive connection table + parameter editor (V4: status from engine)."""
 
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QTabWidget, QTableWidget, QTableWidgetItem,
     QHeaderView, QAbstractItemView,
 )
 from PyQt6.QtCore import Qt
-from PyQt6.QtGui import QColor, QBrush
+from PyQt6.QtGui import QColor
 
 from topstitcher.core.data_model import (
     PortAssignment, PortDirection, InstanceInfo,
+)
+from topstitcher.core.connection_engine import (
+    S_GLOBAL, S_PROMOTED, S_SUGGESTED, S_WIDTH_MISMATCH,
+    S_MULTI_DRIVER, S_UNDRIVEN, S_CONFLICT,
 )
 
 # Port table column indices
@@ -30,8 +34,26 @@ _DIR_COLORS = {
     PortDirection.INOUT: QColor(30, 90, 210),
 }
 
-_PROMOTED_BG = QColor(255, 235, 205)   # light orange
-_GLOBAL_BG = QColor(220, 240, 255)     # light blue
+# Status → (background color, foreground color)
+_STATUS_STYLES: dict[str, tuple[QColor, QColor]] = {
+    S_GLOBAL:         (QColor(220, 240, 255), QColor(0, 100, 200)),     # light blue
+    S_PROMOTED:       (QColor(255, 235, 205), QColor(200, 100, 0)),     # light orange
+    S_SUGGESTED:      (QColor(220, 255, 220), QColor(0, 130, 0)),       # light green
+    S_WIDTH_MISMATCH: (QColor(255, 255, 200), QColor(180, 140, 0)),     # light yellow
+    S_MULTI_DRIVER:   (QColor(255, 210, 210), QColor(200, 0, 0)),       # light red
+    S_UNDRIVEN:       (QColor(255, 230, 210), QColor(200, 80, 0)),      # light amber
+    S_CONFLICT:       (QColor(255, 200, 200), QColor(180, 0, 0)),       # red
+}
+
+
+def _status_style(status: str) -> tuple[QColor | None, QColor | None]:
+    """Pick the highest-priority style from a possibly comma-separated status."""
+    priority = [S_MULTI_DRIVER, S_CONFLICT, S_UNDRIVEN, S_WIDTH_MISMATCH,
+                S_PROMOTED, S_GLOBAL, S_SUGGESTED]
+    for tag in priority:
+        if tag in status:
+            return _STATUS_STYLES[tag]
+    return None, None
 
 
 class ConnectionViewWidget(QWidget):
@@ -76,33 +98,13 @@ class ConnectionViewWidget(QWidget):
         self.param_table.setSortingEnabled(True)
         self.tabs.addTab(self.param_table, "Instance Parameters")
 
-    def load_assignments(
-        self,
-        assignments: list[PortAssignment],
-        promoted_ports: set[tuple[str, str]] | None = None,
-        global_signals: list[str] | None = None,
-    ):
-        """Populate port connection table with status indicators."""
-        if promoted_ports is None:
-            promoted_ports = set()
-        global_set = set(global_signals) if global_signals else set()
-
+    def load_assignments(self, assignments: list[PortAssignment]):
+        """Populate port connection table. Status comes from PortAssignment.status."""
         self.table.setSortingEnabled(False)
         self.table.setRowCount(len(assignments))
-        for row, a in enumerate(assignments):
-            is_promoted = (a.instance_name, a.port_name) in promoted_ports
-            is_global = a.port_name in global_set
 
-            # Determine status text and background
-            if is_promoted:
-                status_text = "Promoted"
-                bg = _PROMOTED_BG
-            elif is_global:
-                status_text = "Global"
-                bg = _GLOBAL_BG
-            else:
-                status_text = ""
-                bg = None
+        for row, a in enumerate(assignments):
+            bg, fg = _status_style(a.status)
 
             # Instance Name (read-only)
             inst_item = QTableWidgetItem(a.instance_name)
@@ -143,16 +145,14 @@ class ConnectionViewWidget(QWidget):
             self.table.setItem(row, COL_NET, net_item)
 
             # Status (read-only)
-            status_item = QTableWidgetItem(status_text)
+            status_item = QTableWidgetItem(a.status)
             status_item.setFlags(
                 status_item.flags() & ~Qt.ItemFlag.ItemIsEditable
             )
             if bg:
                 status_item.setBackground(bg)
-            if is_promoted:
-                status_item.setForeground(QColor(200, 100, 0))
-            elif is_global:
-                status_item.setForeground(QColor(0, 100, 200))
+            if fg:
+                status_item.setForeground(fg)
             self.table.setItem(row, COL_STATUS, status_item)
 
         self.table.setSortingEnabled(True)
@@ -175,7 +175,6 @@ class ConnectionViewWidget(QWidget):
             name_item.setFlags(name_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
             self.param_table.setItem(row, PCOL_PARAM, name_item)
 
-            # Value is EDITABLE
             val_item = QTableWidgetItem(pval)
             self.param_table.setItem(row, PCOL_VALUE, val_item)
 
@@ -215,17 +214,6 @@ class ConnectionViewWidget(QWidget):
                 assigned_net=net,
             ))
         return assignments
-
-    def get_promoted_rows(self) -> list[tuple[str, str]]:
-        """Return list of (instance_name, port_name) for rows marked Promoted."""
-        result = []
-        for row in range(self.table.rowCount()):
-            status_item = self.table.item(row, COL_STATUS)
-            if status_item and status_item.text() == "Promoted":
-                inst = self.table.item(row, COL_INSTANCE).text()
-                port = self.table.item(row, COL_PORT).text()
-                result.append((inst, port))
-        return result
 
     def read_parameters(self) -> dict[tuple[str, str], str]:
         """Read edited parameter values: {(instance_name, param_name): value}."""

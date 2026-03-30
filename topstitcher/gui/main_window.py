@@ -176,6 +176,7 @@ class MainWindow(QMainWindow):
         )
         self.connection_view.load_assignments(assignments)
         self.connection_view.load_parameters(instances)
+        self.connection_view.load_instances_to_canvas(instances)
         self._update_buttons(True)
 
         # Count diagnostics for status bar

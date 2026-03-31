@@ -24,7 +24,7 @@ logger = logging.getLogger(__name__)
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("TopStitcher V2 - Verilog Top Module Generator")
+        self.setWindowTitle("TopStitcher V5 - Verilog Top Module Generator")
         self.resize(1200, 700)
 
         self.parser = RtlParser()
@@ -342,7 +342,7 @@ class MainWindow(QMainWindow):
     def _on_about(self):
         QMessageBox.about(
             self, "About TopStitcher",
-            "TopStitcher V2\n\n"
+            "TopStitcher V5\n\n"
             "Automatic Verilog top-level module generator\n"
             "with manual override support.\n\n"
             "Features:\n"

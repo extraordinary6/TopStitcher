@@ -9,7 +9,7 @@ from PyQt6.QtWidgets import (
     QGraphicsEllipseItem, QGraphicsPathItem, QGraphicsTextItem,
     QGraphicsItem, QGraphicsSceneMouseEvent, QMenu,
 )
-from PyQt6.QtCore import Qt, QPointF
+from PyQt6.QtCore import Qt, QPointF, QVariantAnimation, QEasingCurve
 from PyQt6.QtGui import (
     QPen, QBrush, QColor, QPainterPath, QFont, QPainter,
     QWheelEvent, QMouseEvent,
@@ -267,6 +267,10 @@ class WireItem(QGraphicsPathItem):
 class SchematicCanvas(QGraphicsView):
     """Interactive schematic view with nodes, ports, and wires."""
 
+    # Layout spacing constants
+    H_SPACING = 300
+    V_SPACING = 200
+
     def __init__(self, table_widget=None, parent=None):
         super().__init__(parent)
         self._scene = QGraphicsScene(self)
@@ -285,6 +289,7 @@ class SchematicCanvas(QGraphicsView):
         self._drag_source: PortItem | None = None
         self._on_connection_made = None
         self._on_connection_removed = None
+        self._animations: list[QVariantAnimation] = []
 
         # Manual mode: user draws wires by hand. Auto mode: sync from table.
         self.manual_mode: bool = False
@@ -524,3 +529,200 @@ class SchematicCanvas(QGraphicsView):
         self.clear_all()
         for inst in instances:
             self.add_node(inst)
+
+    # ── Auto-Layout (Hierarchical Left-to-Right Dataflow) ─
+
+    def auto_layout(self):
+        """Execute the hierarchical left-to-right auto-layout algorithm.
+
+        Step A: Build a directed dependency graph from the QTableWidget.
+        Step B: Assign levels via topological sort (with cycle-break fail-safe).
+        Step C: Calculate (X, Y) coordinates and animate nodes.
+        """
+        if not self._nodes or not self._table:
+            return
+
+        # Step A
+        adj = self._build_dependency_graph()
+
+        # Step B
+        levels = self._assign_levels(adj)
+
+        # Step C
+        positions = self._calculate_positions(levels)
+
+        # Animate
+        self._animate_to_positions(positions)
+
+    # ── Step A: Dependency Graph ──────────────────────────
+
+    def _build_dependency_graph(self) -> dict[str, set[str]]:
+        """Analyse the table to create inst_A → inst_B edges.
+
+        An edge exists when an *output* of A shares a net name with
+        an *input* of B.
+        """
+        from topstitcher.gui.connection_view import (
+            COL_INSTANCE, COL_DIR, COL_NET,
+        )
+
+        # net_name → [(instance_name, direction_str)]
+        net_map: dict[str, list[tuple[str, str]]] = {}
+        for row in range(self._table.rowCount()):
+            inst_item = self._table.item(row, COL_INSTANCE)
+            dir_item = self._table.item(row, COL_DIR)
+            net_item = self._table.item(row, COL_NET)
+            if not (inst_item and dir_item and net_item):
+                continue
+            inst = inst_item.text()
+            direction = dir_item.text()
+            net = net_item.text().strip()
+            if net:
+                net_map.setdefault(net, []).append((inst, direction))
+
+        # Build adjacency: output→input across different instances
+        adj: dict[str, set[str]] = {name: set() for name in self._nodes}
+
+        for net_name, ports in net_map.items():
+            if len(ports) < 2:
+                continue
+            drivers = [
+                inst for inst, d in ports
+                if d in ("output", "inout") and inst in self._nodes
+            ]
+            receivers = [
+                inst for inst, d in ports
+                if d in ("input", "inout") and inst in self._nodes
+            ]
+            for drv in drivers:
+                for rcv in receivers:
+                    if drv != rcv:
+                        adj[drv].add(rcv)
+
+        return adj
+
+    # ── Step B: Level Assignment (Topological Sort) ───────
+
+    def _assign_levels(self, adj: dict[str, set[str]]) -> dict[str, int]:
+        """Assign each node a *level* (column) using Kahn's algorithm.
+
+        Nodes driven only by top-level inputs (in-degree 0) are Level 0.
+        A fail-safe breaks feedback loops by forcing the node with the
+        smallest in-degree into the current level.
+        """
+        all_nodes = set(self._nodes.keys())
+
+        # Compute in-degree (only for edges among existing nodes)
+        in_degree: dict[str, int] = {n: 0 for n in all_nodes}
+        for src in all_nodes:
+            for dst in adj.get(src, set()):
+                if dst in in_degree:
+                    in_degree[dst] += 1
+
+        levels: dict[str, int] = {}
+        remaining = set(all_nodes)
+        current_level = 0
+
+        while remaining:
+            # Collect nodes with in-degree 0
+            zero_in = [n for n in remaining if in_degree[n] == 0]
+
+            if not zero_in:
+                # ── Cycle detected! Break it gracefully ──
+                # Pick the node with the smallest in-degree to minimise
+                # layout disruption.
+                node = min(remaining, key=lambda n: in_degree[n])
+                in_degree[node] = 0
+                zero_in = [node]
+
+            for node in zero_in:
+                levels[node] = current_level
+                remaining.discard(node)
+
+            # Reduce in-degree of successors
+            for node in zero_in:
+                for neighbor in adj.get(node, set()):
+                    if neighbor in remaining:
+                        in_degree[neighbor] = max(0, in_degree[neighbor] - 1)
+
+            current_level += 1
+
+        return levels
+
+    # ── Step C: Coordinate Calculation ────────────────────
+
+    def _calculate_positions(
+        self, levels: dict[str, int],
+    ) -> dict[str, tuple[float, float]]:
+        """Map level assignments to (X, Y) pixel coordinates.
+
+        Nodes in the same level are stacked vertically; the entire
+        layout is centred around the scene origin.
+        """
+        if not levels:
+            return {}
+
+        # Group by level
+        level_groups: dict[int, list[str]] = {}
+        for node_name, level in levels.items():
+            level_groups.setdefault(level, []).append(node_name)
+
+        # Sort within each level for deterministic output
+        for lvl in level_groups:
+            level_groups[lvl].sort()
+
+        positions: dict[str, tuple[float, float]] = {}
+
+        for lvl, nodes in level_groups.items():
+            x = lvl * self.H_SPACING
+            # Centre this column vertically
+            total_h = (len(nodes) - 1) * self.V_SPACING
+            start_y = -total_h / 2.0
+            for i, name in enumerate(nodes):
+                positions[name] = (x, start_y + i * self.V_SPACING)
+
+        # Centre the whole layout around (0, 0)
+        if positions:
+            avg_x = sum(p[0] for p in positions.values()) / len(positions)
+            avg_y = sum(p[1] for p in positions.values()) / len(positions)
+            positions = {
+                n: (x - avg_x, y - avg_y)
+                for n, (x, y) in positions.items()
+            }
+
+        return positions
+
+    # ── Smooth Animation ─────────────────────────────────
+
+    def _animate_to_positions(
+        self, positions: dict[str, tuple[float, float]],
+    ):
+        """Slide every node to its target (X, Y) over 300 ms."""
+        # Stop any running animations from a previous layout run
+        for anim in self._animations:
+            anim.stop()
+        self._animations.clear()
+
+        for node_name, (tx, ty) in positions.items():
+            node = self._nodes.get(node_name)
+            if node is None:
+                continue
+
+            start = node.pos()
+            end = QPointF(tx, ty)
+
+            anim = QVariantAnimation()
+            anim.setDuration(300)
+            anim.setStartValue(start)
+            anim.setEndValue(end)
+            anim.setEasingCurve(QEasingCurve.Type.InOutCubic)
+
+            # Closure helper to capture *this* node
+            def _make_slot(n: NodeItem):
+                def _on_value(value):
+                    n.setPos(value)
+                return _on_value
+
+            anim.valueChanged.connect(_make_slot(node))
+            anim.start()
+            self._animations.append(anim)

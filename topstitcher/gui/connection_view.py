@@ -114,6 +114,14 @@ class ConnectionViewWidget(QWidget):
         toolbar.addWidget(self._del_wire_btn)
 
         toolbar.addStretch()
+
+        self._auto_layout_btn = QPushButton("⚡ Auto Layout")
+        self._auto_layout_btn.setToolTip(
+            "Arrange nodes in a left-to-right hierarchical dataflow layout.\n"
+            "Analyses output→input connections to determine module ordering."
+        )
+        self._auto_layout_btn.clicked.connect(self._on_auto_layout_clicked)
+        toolbar.addWidget(self._auto_layout_btn)
         canvas_layout.addLayout(toolbar)
 
         self.canvas = SchematicCanvas(table_widget=self.table)
@@ -161,6 +169,12 @@ class ConnectionViewWidget(QWidget):
 
     def _on_delete_wire_clicked(self):
         self.canvas.delete_selected_wires()
+
+    def _on_auto_layout_clicked(self):
+        """Sync wires (if auto mode) and run the hierarchical auto-layout."""
+        if not self.canvas.manual_mode:
+            self.canvas.sync_wires_from_table()
+        self.canvas.auto_layout()
 
     # ── Tab change sync ───────────────────────────────────
 

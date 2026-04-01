@@ -1,2 +1,6 @@
 .claude/
 prompt/
+__pycache__/
+.vscode/
+.pytest_cache/
+.pytest_tmp/

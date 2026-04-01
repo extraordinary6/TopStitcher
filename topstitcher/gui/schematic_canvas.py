@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import heapq
+import math
 from typing import Optional
 
 from PyQt6.QtWidgets import (
@@ -9,7 +11,7 @@ from PyQt6.QtWidgets import (
     QGraphicsEllipseItem, QGraphicsPathItem, QGraphicsTextItem,
     QGraphicsItem, QGraphicsSceneMouseEvent, QMenu,
 )
-from PyQt6.QtCore import Qt, QPointF, QVariantAnimation, QEasingCurve
+from PyQt6.QtCore import Qt, QPointF, QVariantAnimation, QEasingCurve, QTimer
 from PyQt6.QtGui import (
     QPen, QBrush, QColor, QPainterPath, QFont, QPainter,
     QWheelEvent, QMouseEvent,
@@ -40,6 +42,77 @@ _WIRE_SELECTED_COLOR = QColor(220, 60, 60)
 _NODE_BG = QColor(240, 245, 255)
 _NODE_BORDER = QColor(100, 120, 160)
 _NODE_HEADER_BG = QColor(70, 90, 140)
+GRID_STEP = 16
+NODE_CLEARANCE = 28
+PORT_ANCHOR_OFFSET = 48
+WIRE_RESERVED_PENALTY = 180.0
+TURN_PENALTY = 0.8
+LOCAL_PAD_MIN = 8
+LOCAL_PAD_MAX = 28
+LOCAL_EXPAND_STEP = 14
+ROUTE_DEBOUNCE_MS = 24
+RESERVED_HALO_RADIUS = 1
+ROUTE_BAND_MARGIN = 12
+ROUTE_OUT_OF_BAND_PENALTY = 0.7
+LANE_STEP = GRID_STEP * 2
+LANE_SCAN_STEPS = 72
+LANE_OUTER_MARGIN = 128
+RESERVED_OVERLAP_PENALTY = 220
+BLOCK_CONFLICT_PENALTY = 12000
+
+
+def _same_x(a: QPointF, b: QPointF) -> bool:
+    return math.isclose(a.x(), b.x(), abs_tol=0.5)
+
+
+def _same_y(a: QPointF, b: QPointF) -> bool:
+    return math.isclose(a.y(), b.y(), abs_tol=0.5)
+
+
+def _manhattan(a: tuple[int, int], b: tuple[int, int]) -> int:
+    return abs(a[0] - b[0]) + abs(a[1] - b[1])
+
+
+def _simplify_points(points: list[QPointF]) -> list[QPointF]:
+    simplified: list[QPointF] = []
+    for point in points:
+        if simplified and math.isclose(
+            simplified[-1].x(), point.x(), abs_tol=0.5
+        ) and math.isclose(simplified[-1].y(), point.y(), abs_tol=0.5):
+            continue
+        simplified.append(point)
+
+    changed = True
+    while changed and len(simplified) >= 3:
+        changed = False
+        result = [simplified[0]]
+        for idx in range(1, len(simplified) - 1):
+            prev_point = result[-1]
+            point = simplified[idx]
+            next_point = simplified[idx + 1]
+            same_x = _same_x(prev_point, point) and _same_x(point, next_point)
+            same_y = _same_y(prev_point, point) and _same_y(point, next_point)
+            if same_x or same_y:
+                changed = True
+                continue
+            result.append(point)
+        result.append(simplified[-1])
+        simplified = result
+
+    return simplified
+
+
+def _unique_cells_in_order(
+    cells: list[tuple[int, int]],
+) -> list[tuple[int, int]]:
+    unique: list[tuple[int, int]] = []
+    seen: set[tuple[int, int]] = set()
+    for cell in cells:
+        if cell in seen:
+            continue
+        seen.add(cell)
+        unique.append(cell)
+    return unique
 
 
 # ── PortItem ─────────────────────────────────────────────
@@ -193,7 +266,7 @@ class NodeItem(QGraphicsRectItem):
 # ── WireItem ─────────────────────────────────────────────
 
 class WireItem(QGraphicsPathItem):
-    """A cubic Bezier wire between two PortItems."""
+    """An orthogonal wire between two PortItems."""
 
     def __init__(
         self,
@@ -209,8 +282,13 @@ class WireItem(QGraphicsPathItem):
         self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsSelectable, True)
         self.setAcceptHoverEvents(True)
         self._temporary = target is None
+        self._lane_hint = 0
+        self._route_cells: list[tuple[int, int]] = []
         self._update_pen()
-        self.update_path(end_pos)
+        if end_pos is not None:
+            self._pending_end_pos = end_pos
+        else:
+            self._pending_end_pos = None
 
     def _update_pen(self):
         if self._temporary:
@@ -226,40 +304,63 @@ class WireItem(QGraphicsPathItem):
         return super().itemChange(change, value)
 
     def update_path(self, end_pos: QPointF | None = None):
-        p1 = self.source.center_scene_pos()
-        if self.target:
-            p2 = self.target.center_scene_pos()
-        elif end_pos:
-            p2 = end_pos
-        else:
-            return
-
-        dx = abs(p2.x() - p1.x()) * 0.5
-        dx = max(dx, 40)
-
-        if self.source.direction in (PortDirection.OUTPUT, PortDirection.INOUT):
-            c1 = QPointF(p1.x() + dx, p1.y())
-        else:
-            c1 = QPointF(p1.x() - dx, p1.y())
-
-        if self.target:
-            if self.target.direction in (PortDirection.INPUT, PortDirection.INOUT):
-                c2 = QPointF(p2.x() - dx, p2.y())
+        if end_pos is None and self._pending_end_pos is not None and self.target is None:
+            end_pos = self._pending_end_pos
+        canvas = self._canvas()
+        if canvas:
+            if self.target:
+                points, cells = canvas.route_between_ports(
+                    self.source, self.target, exclude_wire=self,
+                    lane_hint=self._lane_hint,
+                )
+            elif end_pos:
+                points, cells = canvas.route_drag_preview(self.source, end_pos)
             else:
-                c2 = QPointF(p2.x() + dx, p2.y())
+                return
         else:
-            c2 = QPointF(p2.x() - dx, p2.y())
+            p1 = self.source.center_scene_pos()
+            p2 = self.target.center_scene_pos() if self.target else end_pos
+            if p2 is None:
+                return
+            mid_x = (p1.x() + p2.x()) / 2.0
+            points = [p1, QPointF(mid_x, p1.y()), QPointF(mid_x, p2.y()), p2]
+            cells = []
 
-        path = QPainterPath(p1)
-        path.cubicTo(c1, c2, p2)
+        self._route_cells = cells
+        path = self._orthogonal_path(points)
         self.setPath(path)
 
     def finalize(self, target: PortItem, net_name: str):
         self.target = target
         self.net_name = net_name
         self._temporary = False
+        self._pending_end_pos = None
         self._update_pen()
         self.update_path()
+
+    def set_route(
+        self, points: list[QPointF], cells: list[tuple[int, int]]
+    ):
+        self._route_cells = list(cells)
+        self.setPath(self._orthogonal_path(points))
+
+    def _orthogonal_path(self, points: list[QPointF]) -> QPainterPath:
+        route = _simplify_points(points)
+        if not route:
+            route = [self.source.center_scene_pos()]
+
+        path = QPainterPath(route[0])
+        for point in route[1:]:
+            path.lineTo(point)
+        return path
+
+    def _canvas(self) -> Optional[SchematicCanvas]:
+        scene = self.scene()
+        if scene:
+            views = scene.views()
+            if views and isinstance(views[0], SchematicCanvas):
+                return views[0]
+        return None
 
 
 # ── SchematicCanvas ──────────────────────────────────────
@@ -290,6 +391,7 @@ class SchematicCanvas(QGraphicsView):
         self._on_connection_made = None
         self._on_connection_removed = None
         self._animations: list[QVariantAnimation] = []
+        self._reroute_pending = False
 
         # Manual mode: user draws wires by hand. Auto mode: sync from table.
         self.manual_mode: bool = False
@@ -331,6 +433,7 @@ class SchematicCanvas(QGraphicsView):
         self._wires.clear()
         self._drag_wire = None
         self._drag_source = None
+        self._reroute_pending = False
         self._scene.clear()
 
     # ── Wire management ───────────────────────────────────
@@ -348,41 +451,64 @@ class SchematicCanvas(QGraphicsView):
         if not self._table:
             return
 
-        from topstitcher.gui.connection_view import COL_INSTANCE, COL_PORT, COL_NET
-        net_map: dict[str, list[tuple[str, str]]] = {}
+        from topstitcher.gui.connection_view import (
+            COL_DIR, COL_INSTANCE, COL_PORT, COL_NET,
+        )
+        net_map: dict[str, list[tuple[str, str, str]]] = {}
         for row in range(self._table.rowCount()):
             inst_item = self._table.item(row, COL_INSTANCE)
             port_item = self._table.item(row, COL_PORT)
+            dir_item = self._table.item(row, COL_DIR)
             net_item = self._table.item(row, COL_NET)
-            if not (inst_item and port_item and net_item):
+            if not (inst_item and port_item and dir_item and net_item):
                 continue
             inst = inst_item.text()
             port = port_item.text()
+            direction = dir_item.text()
             net = net_item.text().strip()
             if net:
-                net_map.setdefault(net, []).append((inst, port))
+                net_map.setdefault(net, []).append((inst, port, direction))
 
-        for net_name, ports in net_map.items():
+        def endpoint_x(ep: tuple[str, str, str]) -> float:
+            pi = self._find_port_item(ep[0], ep[1])
+            if pi:
+                return pi.center_scene_pos().x()
+            return float("inf")
+
+        lane_counters: dict[tuple[str, str], int] = {}
+        for net_name, endpoints in net_map.items():
+            ports = list(endpoints)
             if len(ports) < 2:
                 continue
-            src_inst, src_port = ports[0]
+            drivers = [p for p in ports if p[2] in ("output", "inout")]
+            if drivers:
+                src_entry = min(drivers, key=endpoint_x)
+                src_inst, src_port, _ = src_entry
+                targets = [p for p in ports if p != src_entry]
+            else:
+                # Pure input nets (clk/rst style) should fan out from the leftmost node.
+                src_entry = min(ports, key=endpoint_x)
+                src_inst, src_port, _ = src_entry
+                targets = [p for p in ports if p != src_entry]
             src_pi = self._find_port_item(src_inst, src_port)
             if not src_pi:
                 continue
-            for dst_inst, dst_port in ports[1:]:
+            targets.sort(key=endpoint_x)
+            for dst_inst, dst_port, _ in targets:
                 dst_pi = self._find_port_item(dst_inst, dst_port)
                 if not dst_pi:
                     continue
                 wire = WireItem(src_pi, dst_pi)
                 wire.net_name = net_name
+                lane_key = self._lane_key(src_pi, dst_pi)
+                wire._lane_hint = lane_counters.get(lane_key, 0)
+                lane_counters[lane_key] = wire._lane_hint + 1
                 self._scene.addItem(wire)
                 self._wires.append(wire)
+        self._reroute_all_wires()
 
     def update_wires_for_node(self, node: NodeItem):
-        for wire in self._wires:
-            if (wire.source.instance_name == node.instance_name
-                    or (wire.target and wire.target.instance_name == node.instance_name)):
-                wire.update_path()
+        self._schedule_reroute()
 
     def delete_selected_wires(self):
         """Delete all currently selected wires and update the table."""
@@ -402,8 +528,219 @@ class SchematicCanvas(QGraphicsView):
                 wire.target.instance_name, wire.target.port_name,
                 wire.net_name,
             )
+        self._schedule_reroute()
 
     # ── Context menu ──────────────────────────────────────
+
+    def _schedule_reroute(self):
+        if self._reroute_pending:
+            return
+        self._reroute_pending = True
+        QTimer.singleShot(ROUTE_DEBOUNCE_MS, self._flush_reroute)
+
+    def _flush_reroute(self):
+        self._reroute_pending = False
+        self._reroute_all_wires()
+
+    def _reroute_all_wires(self):
+        if not self._wires:
+            return
+
+        blocked = self._blocked_cells()
+        blocked_x = self._blocked_x_intervals()
+        reserved: set[tuple[int, int]] = set()
+        groups = self._group_wires_for_routing()
+        for group in groups:
+            if self._can_route_group_as_bus(group):
+                self._route_bus_group(
+                    group, blocked, blocked_x, reserved,
+                )
+                continue
+            for wire in group:
+                if not wire.target:
+                    continue
+                points, cells = self.route_between_ports(
+                    wire.source, wire.target, exclude_wire=wire,
+                    blocked_cells=blocked, reserved_cells=reserved,
+                    lane_hint=wire._lane_hint,
+                    blocked_x_intervals=blocked_x,
+                )
+                wire.set_route(points, cells)
+                reserved.update(cells)
+
+    def _group_wires_for_routing(self) -> list[list[WireItem]]:
+        by_key: dict[tuple[str, str, str], list[WireItem]] = {}
+        for wire in self._wires:
+            if not wire.target:
+                continue
+            key = (
+                wire.net_name,
+                wire.source.instance_name,
+                wire.source.port_name,
+            )
+            by_key.setdefault(key, []).append(wire)
+
+        ordered: list[tuple[int, int, tuple[str, str, str], list[WireItem]]] = []
+        for idx, (key, wires) in enumerate(by_key.items()):
+            source = wires[0].source
+            sx = source.center_scene_pos().x()
+            sy = source.center_scene_pos().y()
+            tx = sum(w.target.center_scene_pos().x() for w in wires if w.target) / len(wires)
+            ty = sum(w.target.center_scene_pos().y() for w in wires if w.target) / len(wires)
+            metric = abs(int(round(sx - tx))) + abs(int(round(sy - ty)))
+            ordered.append((metric, idx, key, wires))
+
+        ordered.sort(key=lambda item: (item[0], item[1]))
+        return [wires for _, _, _, wires in ordered]
+
+    def _can_route_group_as_bus(self, wires: list[WireItem]) -> bool:
+        if len(wires) < 2:
+            return False
+        src_inst = wires[0].source.instance_name
+        src_port = wires[0].source.port_name
+        same_source = all(
+            wire.target is not None
+            and wire.source.instance_name == src_inst
+            and wire.source.port_name == src_port
+            for wire in wires
+        )
+        if not same_source:
+            return False
+
+        src_x = wires[0].source.center_scene_pos().x()
+        directions = set()
+        for wire in wires:
+            if not wire.target:
+                continue
+            dx = wire.target.center_scene_pos().x() - src_x
+            if abs(dx) < GRID_STEP:
+                continue
+            directions.add(1 if dx > 0 else -1)
+        return len(directions) <= 1
+
+    def _route_bus_group(
+        self,
+        wires: list[WireItem],
+        blocked: set[tuple[int, int]],
+        blocked_x: list[tuple[float, float]],
+        reserved: set[tuple[int, int]],
+    ):
+        if not wires:
+            return
+        source = wires[0].source
+        lane_hint = min(w._lane_hint for w in wires)
+        start = source.center_scene_pos()
+        start_anchor = self._port_anchor(source, lane_hint=min(lane_hint, 4))
+        targets = [w.target for w in wires if w.target]
+        if not targets:
+            return
+
+        avg_target_x = sum(t.center_scene_pos().x() for t in targets) / len(targets)
+        avg_target_y = sum(t.center_scene_pos().y() for t in targets) / len(targets)
+        prefer_forward = start.x() <= avg_target_x
+        proxy_anchor = QPointF(avg_target_x, avg_target_y)
+        base_trunk_x = self._select_trunk_x(
+            start_anchor,
+            proxy_anchor,
+            blocked_x,
+            lane_hint,
+            prefer_forward=prefer_forward,
+        )
+
+        candidates = self._bus_trunk_candidates(
+            base_trunk_x, blocked_x, prefer_forward,
+        )
+        reserved_halo = self._expanded_cells(reserved, RESERVED_HALO_RADIUS)
+        targets_sorted = sorted(
+            wires,
+            key=lambda w: w.target.center_scene_pos().y() if w.target else 0.0
+        )
+
+        best_x = candidates[0] if candidates else base_trunk_x
+        best_score = float("inf")
+        best_routes: list[tuple[WireItem, list[QPointF], list[tuple[int, int]]]] = []
+
+        for trunk_x in candidates:
+            score = 0.0
+            routes: list[tuple[WireItem, list[QPointF], list[tuple[int, int]]]] = []
+            for idx, wire in enumerate(targets_sorted):
+                if not wire.target:
+                    continue
+                target = wire.target
+                end = target.center_scene_pos()
+                end_anchor = self._port_anchor(target, lane_hint=min(lane_hint + idx, 4))
+                points = self._compose_lane_route_points(
+                    start, start_anchor, end_anchor, end, trunk_x,
+                )
+                cells = self._orthogonal_cells_from_points(points)
+                block_hits = self._blocked_conflicts(
+                    cells, blocked, start_anchor, end_anchor
+                )
+                reserve_hits = len(set(cells).intersection(reserved_halo))
+                score += (
+                    block_hits * BLOCK_CONFLICT_PENALTY
+                    + reserve_hits * RESERVED_OVERLAP_PENALTY
+                    + len(cells)
+                )
+                routes.append((wire, points, cells))
+
+            if score < best_score:
+                best_score = score
+                best_x = trunk_x
+                best_routes = routes
+
+            if score == 0:
+                break
+
+        if not best_routes:
+            return
+
+        for idx, (wire, points, cells) in enumerate(best_routes):
+            if wire.target is None:
+                continue
+            source_anchor = self._port_anchor(source, lane_hint=min(lane_hint, 4))
+            target_anchor = self._port_anchor(
+                wire.target, lane_hint=min(lane_hint + idx, 4)
+            )
+            if self._blocked_conflicts(cells, blocked, source_anchor, target_anchor) > 0:
+                alt_points, alt_cells = self.route_between_ports(
+                    wire.source,
+                    wire.target,
+                    exclude_wire=wire,
+                    blocked_cells=blocked,
+                    reserved_cells=reserved,
+                    lane_hint=wire._lane_hint,
+                    blocked_x_intervals=blocked_x,
+                )
+                wire.set_route(alt_points, alt_cells)
+                reserved.update(alt_cells)
+                continue
+
+            wire.set_route(points, cells)
+            reserved.update(cells)
+
+    def _bus_trunk_candidates(
+        self,
+        base_trunk_x: float,
+        blocked_x: list[tuple[float, float]],
+        prefer_forward: bool,
+    ) -> list[float]:
+        candidates: list[float] = []
+        signs = [1, -1]
+        if not prefer_forward:
+            signs = [-1, 1]
+
+        def add_candidate(x: float, sign: int):
+            snapped = self._find_clear_lane_x(x, blocked_x, preferred_sign=sign)
+            if any(math.isclose(snapped, existing, abs_tol=0.5) for existing in candidates):
+                return
+            candidates.append(snapped)
+
+        add_candidate(base_trunk_x, signs[0])
+        for step in range(1, 6):
+            for sign in signs:
+                add_candidate(base_trunk_x + sign * step * LANE_STEP, sign)
+        return candidates if candidates else [base_trunk_x]
 
     def _on_context_menu(self, pos):
         scene_pos = self.mapToScene(pos)
@@ -445,6 +782,7 @@ class SchematicCanvas(QGraphicsView):
         self._drag_source = port
         self._drag_wire = WireItem(port, end_pos=scene_pos)
         self._scene.addItem(self._drag_wire)
+        self._drag_wire.update_path(scene_pos)
 
     def is_dragging_wire(self) -> bool:
         return self._drag_wire is not None
@@ -474,8 +812,11 @@ class SchematicCanvas(QGraphicsView):
             else:
                 net_name = f"{target.instance_name}_{target.port_name}"
 
+            lane_key = self._lane_key(src, target)
+            self._drag_wire._lane_hint = self._next_lane_hint(lane_key)
             self._drag_wire.finalize(target, net_name)
             self._wires.append(self._drag_wire)
+            self._schedule_reroute()
             self._drag_wire = None
             self._drag_source = None
 
@@ -507,6 +848,666 @@ class SchematicCanvas(QGraphicsView):
         if node:
             return node.port_items.get(port_name)
         return None
+
+    def _lane_key(self, source: PortItem, target: PortItem) -> tuple[str, str]:
+        src_x = source.center_scene_pos().x()
+        dst_x = target.center_scene_pos().x()
+        if source.direction == PortDirection.INPUT and target.direction == PortDirection.INPUT:
+            owner = source.instance_name if src_x <= dst_x else target.instance_name
+            return ("left_bus", owner)
+        if src_x <= dst_x:
+            return ("fwd", source.instance_name)
+        return ("back", source.instance_name)
+
+    def _next_lane_hint(self, lane_key: tuple[str, str]) -> int:
+        used = {
+            wire._lane_hint
+            for wire in self._wires
+            if wire.target and self._lane_key(wire.source, wire.target) == lane_key
+        }
+        lane = 0
+        while lane in used:
+            lane += 1
+        return lane
+
+    def _blocked_x_intervals(self) -> list[tuple[float, float]]:
+        intervals: list[tuple[float, float]] = []
+        for node in self._nodes.values():
+            rect = node.mapRectToScene(node.rect()).adjusted(
+                -NODE_CLEARANCE, 0,
+                NODE_CLEARANCE, 0,
+            )
+            intervals.append((rect.left(), rect.right()))
+        return self._merge_intervals(intervals)
+
+    def _merge_intervals(
+        self, intervals: list[tuple[float, float]],
+    ) -> list[tuple[float, float]]:
+        if not intervals:
+            return []
+        ordered = sorted(intervals, key=lambda x: x[0])
+        merged: list[tuple[float, float]] = [ordered[0]]
+        for left, right in ordered[1:]:
+            last_left, last_right = merged[-1]
+            if left <= last_right + GRID_STEP:
+                merged[-1] = (last_left, max(last_right, right))
+            else:
+                merged.append((left, right))
+        return merged
+
+    def _x_is_blocked(
+        self, x: float, intervals: list[tuple[float, float]],
+    ) -> bool:
+        return any(left <= x <= right for left, right in intervals)
+
+    def _snap_x_to_grid(self, x: float) -> float:
+        return round(x / GRID_STEP) * GRID_STEP
+
+    def _find_clear_lane_x(
+        self,
+        base_x: float,
+        intervals: list[tuple[float, float]],
+        preferred_sign: int = 1,
+    ) -> float:
+        snapped = self._snap_x_to_grid(base_x)
+        if not self._x_is_blocked(snapped, intervals):
+            return snapped
+
+        signs = [1, -1] if preferred_sign >= 0 else [-1, 1]
+        for step in range(1, LANE_SCAN_STEPS + 1):
+            for sign in signs:
+                candidate = self._snap_x_to_grid(
+                    snapped + sign * step * LANE_STEP
+                )
+                if not self._x_is_blocked(candidate, intervals):
+                    return candidate
+
+        return snapped
+
+    def _select_trunk_x(
+        self,
+        start_anchor: QPointF,
+        end_anchor: QPointF,
+        intervals: list[tuple[float, float]],
+        lane_hint: int,
+        prefer_forward: bool | None = None,
+    ) -> float:
+        sx = start_anchor.x()
+        ex = end_anchor.x()
+        is_forward = (sx <= ex) if prefer_forward is None else prefer_forward
+        if is_forward:
+            # Forward links: spread lanes around midpoint to avoid dense overlaps.
+            base = (sx + ex) / 2.0
+            if lane_hint == 0:
+                desired = base
+                preferred_sign = 1
+            else:
+                magnitude = (lane_hint + 1) // 2
+                sign = 1 if lane_hint % 2 == 1 else -1
+                desired = base + sign * magnitude * LANE_STEP
+                preferred_sign = sign
+            return self._find_clear_lane_x(desired, intervals, preferred_sign)
+
+        # Backward links: route from outer side (left or right) by cost.
+        left_outer = min(sx, ex) - LANE_OUTER_MARGIN
+        right_outer = max(sx, ex) + LANE_OUTER_MARGIN
+        left_cost = abs(sx - left_outer) + abs(ex - left_outer)
+        right_cost = abs(sx - right_outer) + abs(ex - right_outer)
+        if left_cost <= right_cost:
+            desired = left_outer - lane_hint * LANE_STEP
+            preferred_sign = -1
+        else:
+            desired = right_outer + lane_hint * LANE_STEP
+            preferred_sign = 1
+        return self._find_clear_lane_x(desired, intervals, preferred_sign)
+
+    def _compose_lane_route_points(
+        self,
+        start: QPointF,
+        start_anchor: QPointF,
+        end_anchor: QPointF,
+        end: QPointF,
+        trunk_x: float,
+        detour_y: float | None = None,
+    ) -> list[QPointF]:
+        points: list[QPointF] = [start]
+
+        def add_point(point: QPointF):
+            last = points[-1]
+            if _same_x(last, point) and _same_y(last, point):
+                return
+            if (not _same_x(last, point)) and (not _same_y(last, point)):
+                elbow = QPointF(point.x(), last.y())
+                if not (_same_x(last, elbow) and _same_y(last, elbow)):
+                    points.append(elbow)
+            points.append(point)
+
+        add_point(QPointF(start_anchor.x(), start.y()))
+        add_point(start_anchor)
+        if detour_y is not None:
+            add_point(QPointF(start_anchor.x(), detour_y))
+            add_point(QPointF(trunk_x, detour_y))
+            add_point(QPointF(end_anchor.x(), detour_y))
+        else:
+            add_point(QPointF(trunk_x, start_anchor.y()))
+            add_point(QPointF(trunk_x, end_anchor.y()))
+        add_point(end_anchor)
+        add_point(QPointF(end_anchor.x(), end.y()))
+        add_point(end)
+        return _simplify_points(points)
+
+    def _detour_y_from_hint(
+        self,
+        start_anchor: QPointF,
+        end_anchor: QPointF,
+        hint: int,
+        blocked: set[tuple[int, int]],
+    ) -> float | None:
+        if hint <= 0:
+            return None
+        if not blocked:
+            mid_y = (start_anchor.y() + end_anchor.y()) / 2.0
+            step = ((hint + 1) // 2) * PORT_SPACING
+            sign = 1 if hint % 2 == 1 else -1
+            return round((mid_y + sign * step) / GRID_STEP) * GRID_STEP
+
+        rows = [cell[1] for cell in blocked]
+        top_outer = (min(rows) - 2) * GRID_STEP
+        bottom_outer = (max(rows) + 2) * GRID_STEP
+        band_step = ((hint - 1) // 2) * PORT_SPACING
+        if hint % 2 == 1:
+            return top_outer - band_step
+        return bottom_outer + band_step
+
+    def _orthogonal_cells_from_points(
+        self, points: list[QPointF],
+    ) -> list[tuple[int, int]]:
+        if not points:
+            return []
+        cells: list[tuple[int, int]] = []
+        for idx in range(len(points) - 1):
+            start_cell = self._scene_to_grid(points[idx])
+            end_cell = self._scene_to_grid(points[idx + 1])
+            segment = self._straight_cells(start_cell, end_cell)
+            if idx > 0 and segment:
+                segment = segment[1:]
+            cells.extend(segment)
+        return _unique_cells_in_order(cells)
+
+    def _blocked_conflicts(
+        self,
+        cells: list[tuple[int, int]],
+        blocked: set[tuple[int, int]],
+        start_anchor: QPointF,
+        end_anchor: QPointF,
+    ) -> int:
+        if not cells or not blocked:
+            return 0
+        start_cell = self._scene_to_grid(start_anchor)
+        end_cell = self._scene_to_grid(end_anchor)
+        # Let wire leave/enter the owning modules naturally near endpoints.
+        endpoint_allow = max(3, PORT_ANCHOR_OFFSET // GRID_STEP + 2)
+
+        conflicts = 0
+        for cell in cells:
+            if cell not in blocked:
+                continue
+            if _manhattan(cell, start_cell) <= endpoint_allow:
+                continue
+            if _manhattan(cell, end_cell) <= endpoint_allow:
+                continue
+            conflicts += 1
+        return conflicts
+
+    def route_between_ports(
+        self,
+        source: PortItem,
+        target: PortItem,
+        exclude_wire: WireItem | None = None,
+        blocked_cells: set[tuple[int, int]] | None = None,
+        reserved_cells: set[tuple[int, int]] | None = None,
+        lane_hint: int = 0,
+        blocked_x_intervals: list[tuple[float, float]] | None = None,
+    ) -> tuple[list[QPointF], list[tuple[int, int]]]:
+        start = source.center_scene_pos()
+        end = target.center_scene_pos()
+        # Keep anchor fan-out small; major separation is handled by trunk lanes.
+        start_anchor = self._port_anchor(source, lane_hint=min(lane_hint, 4))
+        end_anchor = self._port_anchor(target, lane_hint=min(lane_hint, 4))
+        if blocked_cells is None:
+            blocked = self._blocked_cells()
+        else:
+            blocked = blocked_cells
+        if reserved_cells is None:
+            reserved = self._reserved_cells(exclude_wire=exclude_wire)
+        else:
+            reserved = reserved_cells
+        blocked_x = (
+            blocked_x_intervals
+            if blocked_x_intervals is not None
+            else self._blocked_x_intervals()
+        )
+        reserved_halo = self._expanded_cells(reserved, RESERVED_HALO_RADIUS)
+
+        best_points: list[QPointF] | None = None
+        best_cells: list[tuple[int, int]] | None = None
+        best_score: float = float("inf")
+        max_attempts = max(4, lane_hint + 6)
+        for extra in range(max_attempts):
+            effective_hint = lane_hint + extra
+            trunk_x = self._select_trunk_x(
+                start_anchor, end_anchor, blocked_x, effective_hint,
+                prefer_forward=start.x() <= end.x(),
+            )
+            detour_y = self._detour_y_from_hint(
+                start_anchor, end_anchor, extra, blocked
+            )
+            points = self._compose_lane_route_points(
+                start, start_anchor, end_anchor, end, trunk_x, detour_y,
+            )
+            cells = self._orthogonal_cells_from_points(points)
+            block_hits = self._blocked_conflicts(
+                cells, blocked, start_anchor, end_anchor
+            )
+            reserve_hits = len(set(cells).intersection(reserved_halo))
+            score = (
+                block_hits * BLOCK_CONFLICT_PENALTY
+                + reserve_hits * RESERVED_OVERLAP_PENALTY
+                + len(cells)
+                + extra * 4
+            )
+            if score < best_score:
+                best_score = score
+                best_points = points
+                best_cells = cells
+            if block_hits == 0 and reserve_hits == 0:
+                break
+
+        if best_points is None or best_cells is None:
+            return [start, end], [self._scene_to_grid(start), self._scene_to_grid(end)]
+
+        # Geometrically hard cases fallback to local A* search for correctness.
+        if self._blocked_conflicts(best_cells, blocked, start_anchor, end_anchor) > 0:
+            start_cell = self._scene_to_grid(start_anchor)
+            end_cell = self._scene_to_grid(end_anchor)
+            band = self._routing_band(start_cell, end_cell)
+            for bounds in (
+                self._local_grid_bounds(start_cell, end_cell),
+                None,
+            ):
+                alt_cells = self._find_grid_path(
+                    start_anchor,
+                    end_anchor,
+                    blocked,
+                    reserved,
+                    bounds,
+                    preferred_band=band,
+                )
+                if not alt_cells:
+                    alt_cells = self._find_grid_path(
+                        start_anchor,
+                        end_anchor,
+                        blocked,
+                        set(),
+                        bounds,
+                        preferred_band=band,
+                    )
+                if alt_cells:
+                    alt_points = self._compose_route_points(
+                        start, start_anchor, alt_cells, end_anchor, end,
+                    )
+                    return alt_points, alt_cells
+
+        return best_points, best_cells
+
+    def route_drag_preview(
+        self, source: PortItem, end_pos: QPointF,
+    ) -> tuple[list[QPointF], list[tuple[int, int]]]:
+        start = source.center_scene_pos()
+        start_anchor = self._port_anchor(source)
+        preview_anchor = self._snap_to_grid(end_pos)
+        blocked = self._blocked_cells()
+        blocked_x = self._blocked_x_intervals()
+        trunk_x = self._select_trunk_x(
+            start_anchor, preview_anchor, blocked_x, lane_hint=0,
+            prefer_forward=start.x() <= end_pos.x(),
+        )
+        points = self._compose_lane_route_points(
+            start, start_anchor, preview_anchor, end_pos, trunk_x
+        )
+        cells = self._orthogonal_cells_from_points(points)
+
+        if self._blocked_conflicts(cells, blocked, start_anchor, preview_anchor) > 0:
+            start_cell = self._scene_to_grid(start_anchor)
+            end_cell = self._scene_to_grid(preview_anchor)
+            bounds = self._local_grid_bounds(start_cell, end_cell)
+            band = self._routing_band(start_cell, end_cell)
+            alt_cells = self._find_grid_path(
+                start_anchor, preview_anchor, blocked, set(), bounds,
+                preferred_band=band,
+            )
+            if alt_cells:
+                alt_points = self._compose_route_points(
+                    start, start_anchor, alt_cells, preview_anchor, end_pos,
+                )
+                return alt_points, alt_cells
+
+        return points, cells
+
+    def _compose_route_points(
+        self,
+        start: QPointF,
+        start_anchor: QPointF,
+        cells: list[tuple[int, int]],
+        end_anchor: QPointF,
+        end: QPointF,
+    ) -> list[QPointF]:
+        points: list[QPointF] = [start]
+
+        def add_point(point: QPointF):
+            last = points[-1]
+            if _same_x(last, point) and _same_y(last, point):
+                return
+            if (not _same_x(last, point)) and (not _same_y(last, point)):
+                elbow = QPointF(point.x(), last.y())
+                if not (_same_x(last, elbow) and _same_y(last, elbow)):
+                    points.append(elbow)
+            points.append(point)
+
+        if not _same_x(start, start_anchor):
+            add_point(QPointF(start_anchor.x(), start.y()))
+        add_point(start_anchor)
+
+        grid_points = [self._grid_to_scene(cell) for cell in cells]
+        if grid_points:
+            for point in grid_points[1:-1]:
+                add_point(point)
+
+        add_point(end_anchor)
+        if not _same_y(points[-1], end):
+            add_point(QPointF(points[-1].x(), end.y()))
+        add_point(end)
+
+        return _simplify_points(points)
+
+    def _blocked_cells(self) -> set[tuple[int, int]]:
+        blocked: set[tuple[int, int]] = set()
+        for node in self._nodes.values():
+            rect = node.mapRectToScene(node.rect()).adjusted(
+                -NODE_CLEARANCE, -NODE_CLEARANCE,
+                NODE_CLEARANCE, NODE_CLEARANCE,
+            )
+            gx0 = math.floor(rect.left() / GRID_STEP)
+            gx1 = math.ceil(rect.right() / GRID_STEP)
+            gy0 = math.floor(rect.top() / GRID_STEP)
+            gy1 = math.ceil(rect.bottom() / GRID_STEP)
+            for gx in range(gx0, gx1 + 1):
+                for gy in range(gy0, gy1 + 1):
+                    blocked.add((gx, gy))
+        return blocked
+
+    def _reserved_cells(
+        self, exclude_wire: WireItem | None = None,
+    ) -> set[tuple[int, int]]:
+        reserved: set[tuple[int, int]] = set()
+        for wire in self._wires:
+            if wire is exclude_wire:
+                continue
+            reserved.update(wire._route_cells)
+        return reserved
+
+    def _port_anchor(self, port: PortItem, lane_hint: int = 0) -> QPointF:
+        pos = port.center_scene_pos()
+        lane_offset = min(max(0, lane_hint), 4) * GRID_STEP
+        offset = PORT_ANCHOR_OFFSET + lane_offset
+        if port.direction in (PortDirection.OUTPUT, PortDirection.INOUT):
+            anchor = QPointF(pos.x() + offset, pos.y())
+        else:
+            anchor = QPointF(pos.x() - offset, pos.y())
+        return self._snap_to_grid(anchor)
+
+    def _snap_to_grid(self, point: QPointF) -> QPointF:
+        return self._grid_to_scene(self._scene_to_grid(point))
+
+    def _scene_to_grid(self, point: QPointF) -> tuple[int, int]:
+        return (
+            int(round(point.x() / GRID_STEP)),
+            int(round(point.y() / GRID_STEP)),
+        )
+
+    def _grid_to_scene(self, cell: tuple[int, int]) -> QPointF:
+        return QPointF(cell[0] * GRID_STEP, cell[1] * GRID_STEP)
+
+    def _local_grid_bounds(
+        self, start_cell: tuple[int, int], end_cell: tuple[int, int],
+    ) -> tuple[int, int, int, int]:
+        dx = abs(start_cell[0] - end_cell[0])
+        dy = abs(start_cell[1] - end_cell[1])
+        pad = max(LOCAL_PAD_MIN, min(LOCAL_PAD_MAX, (dx + dy) // 2 + 6))
+        return (
+            min(start_cell[0], end_cell[0]) - pad,
+            max(start_cell[0], end_cell[0]) + pad,
+            min(start_cell[1], end_cell[1]) - pad,
+            max(start_cell[1], end_cell[1]) + pad,
+        )
+
+    def _search_bounds(
+        self, start_cell: tuple[int, int], end_cell: tuple[int, int],
+    ) -> list[tuple[int, int, int, int] | None]:
+        local = self._local_grid_bounds(start_cell, end_cell)
+        return [
+            local,
+            self._expand_bounds(local, LOCAL_EXPAND_STEP),
+            self._expand_bounds(local, LOCAL_EXPAND_STEP * 2),
+            None,
+        ]
+
+    def _expand_bounds(
+        self, bounds: tuple[int, int, int, int], pad: int,
+    ) -> tuple[int, int, int, int]:
+        min_x, max_x, min_y, max_y = bounds
+        return (min_x - pad, max_x + pad, min_y - pad, max_y + pad)
+
+    def _routing_band(
+        self, start_cell: tuple[int, int], end_cell: tuple[int, int],
+    ) -> tuple[int, int]:
+        return (
+            min(start_cell[1], end_cell[1]) - ROUTE_BAND_MARGIN,
+            max(start_cell[1], end_cell[1]) + ROUTE_BAND_MARGIN,
+        )
+
+    def _expanded_cells(
+        self, cells: set[tuple[int, int]], radius: int,
+    ) -> set[tuple[int, int]]:
+        if radius <= 0 or not cells:
+            return set(cells)
+        expanded = set(cells)
+        for cx, cy in cells:
+            for ox in range(-radius, radius + 1):
+                for oy in range(-radius, radius + 1):
+                    if abs(ox) + abs(oy) <= radius:
+                        expanded.add((cx + ox, cy + oy))
+        return expanded
+
+    def _fallback_outer_lane(
+        self,
+        start_cell: tuple[int, int],
+        end_cell: tuple[int, int],
+        blocked: set[tuple[int, int]],
+    ) -> list[tuple[int, int]]:
+        if not blocked:
+            return [start_cell, end_cell]
+
+        ys = [cell[1] for cell in blocked]
+        top_lane = min(ys) - 2
+        bottom_lane = max(ys) + 2
+
+        candidates = []
+        top_cells = self._cells_via_lane(start_cell, end_cell, top_lane)
+        if self._cells_clear(top_cells, blocked, start_cell, end_cell):
+            candidates.append(top_cells)
+
+        bottom_cells = self._cells_via_lane(start_cell, end_cell, bottom_lane)
+        if self._cells_clear(bottom_cells, blocked, start_cell, end_cell):
+            candidates.append(bottom_cells)
+
+        if not candidates:
+            return []
+        return min(candidates, key=len)
+
+    def _cells_via_lane(
+        self,
+        start_cell: tuple[int, int],
+        end_cell: tuple[int, int],
+        lane_y: int,
+    ) -> list[tuple[int, int]]:
+        cells = self._straight_cells(start_cell, (start_cell[0], lane_y))
+        cells.extend(self._straight_cells((start_cell[0], lane_y), (end_cell[0], lane_y))[1:])
+        cells.extend(self._straight_cells((end_cell[0], lane_y), end_cell)[1:])
+        return _unique_cells_in_order(cells)
+
+    def _cells_clear(
+        self,
+        cells: list[tuple[int, int]],
+        blocked: set[tuple[int, int]],
+        start_cell: tuple[int, int],
+        end_cell: tuple[int, int],
+    ) -> bool:
+        for cell in cells:
+            if cell in (start_cell, end_cell):
+                continue
+            if cell in blocked:
+                return False
+        return True
+
+    def _straight_cells(
+        self, start_cell: tuple[int, int], end_cell: tuple[int, int],
+    ) -> list[tuple[int, int]]:
+        if start_cell == end_cell:
+            return [start_cell]
+        x0, y0 = start_cell
+        x1, y1 = end_cell
+        cells = [start_cell]
+        if x0 == x1:
+            step = 1 if y1 >= y0 else -1
+            for y in range(y0 + step, y1 + step, step):
+                cells.append((x0, y))
+            return cells
+        if y0 == y1:
+            step = 1 if x1 >= x0 else -1
+            for x in range(x0 + step, x1 + step, step):
+                cells.append((x, y0))
+            return cells
+        # For any diagonal request, use one elbow.
+        cells.extend(self._straight_cells(start_cell, (x1, y0))[1:])
+        cells.extend(self._straight_cells((x1, y0), end_cell)[1:])
+        return _unique_cells_in_order(cells)
+
+    def _find_grid_path(
+        self,
+        start: QPointF,
+        end: QPointF,
+        blocked: set[tuple[int, int]],
+        reserved: set[tuple[int, int]],
+        bounds: tuple[int, int, int, int] | None,
+        preferred_band: tuple[int, int] | None = None,
+    ) -> list[tuple[int, int]]:
+        start_cell = self._scene_to_grid(start)
+        end_cell = self._scene_to_grid(end)
+        if start_cell == end_cell:
+            return [start_cell]
+
+        blocked = set(blocked)
+        blocked.discard(start_cell)
+        blocked.discard(end_cell)
+
+        if bounds is None:
+            rect = self._scene.sceneRect()
+            min_x = math.floor(rect.left() / GRID_STEP) - 2
+            max_x = math.ceil(rect.right() / GRID_STEP) + 2
+            min_y = math.floor(rect.top() / GRID_STEP) - 2
+            max_y = math.ceil(rect.bottom() / GRID_STEP) + 2
+        else:
+            min_x, max_x, min_y, max_y = bounds
+
+        directions = [(1, 0), (-1, 0), (0, 1), (0, -1)]
+        start_state = (start_cell, None)
+        open_heap: list[tuple[float, float, tuple[int, int], int | None]] = [
+            (_manhattan(start_cell, end_cell), 0.0, start_cell, None)
+        ]
+        came_from: dict[
+            tuple[tuple[int, int], int | None],
+            tuple[tuple[int, int], int | None] | None,
+        ] = {start_state: None}
+        best_cost = {start_state: 0.0}
+
+        while open_heap:
+            _, cost, cell, prev_dir = heapq.heappop(open_heap)
+            state = (cell, prev_dir)
+            if cost > best_cost.get(state, float("inf")):
+                continue
+            if cell == end_cell:
+                return self._reconstruct_cells(came_from, state)
+
+            for dir_idx, (dx, dy) in enumerate(directions):
+                neighbor = (cell[0] + dx, cell[1] + dy)
+                if neighbor[0] < min_x or neighbor[0] > max_x:
+                    continue
+                if neighbor[1] < min_y or neighbor[1] > max_y:
+                    continue
+                if neighbor in blocked:
+                    continue
+
+                step_cost = 1.0
+                if prev_dir is not None and dir_idx != prev_dir:
+                    step_cost += TURN_PENALTY
+                if neighbor in reserved and neighbor not in (start_cell, end_cell):
+                    step_cost += WIRE_RESERVED_PENALTY
+                elif neighbor not in (start_cell, end_cell):
+                    # Also avoid hugging existing wires too closely.
+                    nearby_reserved = any(
+                        (neighbor[0] + ox, neighbor[1] + oy) in reserved
+                        for ox, oy in ((1, 0), (-1, 0), (0, 1), (0, -1))
+                    )
+                    if nearby_reserved:
+                        step_cost += WIRE_RESERVED_PENALTY * 0.35
+                if preferred_band is not None:
+                    band_top, band_bottom = preferred_band
+                    if neighbor[1] < band_top:
+                        step_cost += (band_top - neighbor[1]) * ROUTE_OUT_OF_BAND_PENALTY
+                    elif neighbor[1] > band_bottom:
+                        step_cost += (neighbor[1] - band_bottom) * ROUTE_OUT_OF_BAND_PENALTY
+
+                next_cost = cost + step_cost
+                next_state = (neighbor, dir_idx)
+                if next_cost >= best_cost.get(next_state, float("inf")):
+                    continue
+
+                best_cost[next_state] = next_cost
+                came_from[next_state] = state
+                priority = next_cost + _manhattan(neighbor, end_cell)
+                heapq.heappush(
+                    open_heap,
+                    (priority, next_cost, neighbor, dir_idx),
+                )
+
+        return []
+
+    def _reconstruct_cells(
+        self,
+        came_from: dict[
+            tuple[tuple[int, int], int | None],
+            tuple[tuple[int, int], int | None] | None,
+        ],
+        state: tuple[tuple[int, int], int | None],
+    ) -> list[tuple[int, int]]:
+        cells: list[tuple[int, int]] = []
+        while state is not None:
+            cell, _ = state
+            cells.append(cell)
+            state = came_from.get(state)
+        cells.reverse()
+        return cells
 
     # ── Keyboard shortcuts ────────────────────────────────
 

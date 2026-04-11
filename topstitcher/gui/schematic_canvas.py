@@ -14,7 +14,7 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import Qt, QPointF, QVariantAnimation, QEasingCurve, QTimer
 from PyQt6.QtGui import (
     QPen, QBrush, QColor, QPainterPath, QFont, QPainter,
-    QWheelEvent, QMouseEvent,
+    QWheelEvent, QMouseEvent, QPainterPathStroker,
 )
 
 from topstitcher.core.data_model import PortDirection, InstanceInfo
@@ -307,14 +307,18 @@ class WireItem(QGraphicsPathItem):
         if end_pos is None and self._pending_end_pos is not None and self.target is None:
             end_pos = self._pending_end_pos
         canvas = self._canvas()
+        p1 = self.source.center_scene_pos()
+        p2 = self.target.center_scene_pos() if self.target else end_pos
+        if p2 is None:
+            return
+
         if canvas:
             if self.target:
-                points, cells = canvas.route_between_ports(
-                    self.source, self.target, exclude_wire=self,
-                    lane_hint=self._lane_hint,
+                path = canvas.curve_between_ports(
+                    self.source, self.target, self._lane_hint
                 )
             elif end_pos:
-                points, cells = canvas.route_drag_preview(self.source, end_pos)
+                path = canvas.curve_drag_preview(self.source, end_pos)
             else:
                 return
         else:
@@ -322,12 +326,9 @@ class WireItem(QGraphicsPathItem):
             p2 = self.target.center_scene_pos() if self.target else end_pos
             if p2 is None:
                 return
-            mid_x = (p1.x() + p2.x()) / 2.0
-            points = [p1, QPointF(mid_x, p1.y()), QPointF(mid_x, p2.y()), p2]
-            cells = []
+            path = self._curved_path(p1, p2, self._lane_hint)
 
-        self._route_cells = cells
-        path = self._orthogonal_path(points)
+        self._route_cells = []
         self.setPath(path)
 
     def finalize(self, target: PortItem, net_name: str):
@@ -342,7 +343,60 @@ class WireItem(QGraphicsPathItem):
         self, points: list[QPointF], cells: list[tuple[int, int]]
     ):
         self._route_cells = list(cells)
-        self.setPath(self._orthogonal_path(points))
+        route = _simplify_points(points)
+        if len(route) >= 2:
+            self.setPath(self._curved_path(route[0], route[-1], self._lane_hint))
+        else:
+            self.setPath(self._orthogonal_path(points))
+
+    def _curved_path(
+        self, start: QPointF, end: QPointF, lane_hint: int = 0
+    ) -> QPainterPath:
+        dx = end.x() - start.x()
+        base = max(80.0, min(260.0, abs(dx) * 0.45))
+        lane_offset = ((lane_hint % 6) - 2.5) * 18.0
+        c1 = QPointF(start.x() + base, start.y() + lane_offset)
+        c2 = QPointF(end.x() - base, end.y() + lane_offset)
+        path = QPainterPath(start)
+        path.cubicTo(c1, c2, end)
+        return path
+
+    def _smooth_orthogonal_path(
+        self, points: list[QPointF], radius: float = 18.0
+    ) -> QPainterPath:
+        route = _simplify_points(points)
+        if not route:
+            return QPainterPath()
+        if len(route) < 3:
+            path = QPainterPath(route[0])
+            for point in route[1:]:
+                path.lineTo(point)
+            return path
+
+        path = QPainterPath(route[0])
+        for idx in range(1, len(route) - 1):
+            prev_point = route[idx - 1]
+            point = route[idx]
+            next_point = route[idx + 1]
+
+            in_dx = point.x() - prev_point.x()
+            in_dy = point.y() - prev_point.y()
+            out_dx = next_point.x() - point.x()
+            out_dy = next_point.y() - point.y()
+            in_len = math.hypot(in_dx, in_dy)
+            out_len = math.hypot(out_dx, out_dy)
+            if in_len < 1 or out_len < 1:
+                path.lineTo(point)
+                continue
+
+            trim = min(radius, in_len / 2.0, out_len / 2.0)
+            before = QPointF(point.x() - (in_dx / in_len) * trim, point.y() - (in_dy / in_len) * trim)
+            after = QPointF(point.x() + (out_dx / out_len) * trim, point.y() + (out_dy / out_len) * trim)
+            path.lineTo(before)
+            path.quadTo(point, after)
+
+        path.lineTo(route[-1])
+        return path
 
     def _orthogonal_path(self, points: list[QPointF]) -> QPainterPath:
         route = _simplify_points(points)
@@ -353,6 +407,11 @@ class WireItem(QGraphicsPathItem):
         for point in route[1:]:
             path.lineTo(point)
         return path
+
+    def shape(self):
+        stroker = QPainterPathStroker()
+        stroker.setWidth(12.0)
+        return stroker.createStroke(self.path())
 
     def _canvas(self) -> Optional[SchematicCanvas]:
         scene = self.scene()
@@ -372,7 +431,7 @@ class SchematicCanvas(QGraphicsView):
     H_SPACING = 300
     V_SPACING = 200
 
-    def __init__(self, table_widget=None, parent=None):
+    def __init__(self, parent=None):
         super().__init__(parent)
         self._scene = QGraphicsScene(self)
         self._scene.setSceneRect(-2000, -2000, 4000, 4000)
@@ -383,7 +442,7 @@ class SchematicCanvas(QGraphicsView):
         self.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.customContextMenuRequested.connect(self._on_context_menu)
 
-        self._table = table_widget
+        self._connection_projection: list[tuple[str, str, str, str]] = []
         self._nodes: dict[str, NodeItem] = {}
         self._wires: list[WireItem] = []
         self._drag_wire: WireItem | None = None
@@ -392,9 +451,86 @@ class SchematicCanvas(QGraphicsView):
         self._on_connection_removed = None
         self._animations: list[QVariantAnimation] = []
         self._reroute_pending = False
+        self._suspend_reroute = False
 
-        # Manual mode: user draws wires by hand. Auto mode: sync from table.
+        # Manual mode: user draws wires by hand. Auto mode: sync from projection.
         self.manual_mode: bool = False
+
+    def curve_between_points(
+        self,
+        start: QPointF,
+        end: QPointF,
+        lane_hint: int = 0,
+    ) -> QPainterPath:
+        return WireItem.__dict__["_curved_path"](None, start, end, lane_hint)
+
+    def _smooth_orthogonal_path(
+        self, points: list[QPointF], radius: float = 18.0
+    ) -> QPainterPath:
+        route = _simplify_points(points)
+        if not route:
+            return QPainterPath()
+        if len(route) < 3:
+            path = QPainterPath(route[0])
+            for point in route[1:]:
+                path.lineTo(point)
+            return path
+
+        path = QPainterPath(route[0])
+        for idx in range(1, len(route) - 1):
+            prev_point = route[idx - 1]
+            point = route[idx]
+            next_point = route[idx + 1]
+
+            in_dx = point.x() - prev_point.x()
+            in_dy = point.y() - prev_point.y()
+            out_dx = next_point.x() - point.x()
+            out_dy = next_point.y() - point.y()
+            in_len = math.hypot(in_dx, in_dy)
+            out_len = math.hypot(out_dx, out_dy)
+            if in_len < 1 or out_len < 1:
+                path.lineTo(point)
+                continue
+
+            trim = min(radius, in_len / 2.0, out_len / 2.0)
+            before = QPointF(
+                point.x() - (in_dx / in_len) * trim,
+                point.y() - (in_dy / in_len) * trim,
+            )
+            after = QPointF(
+                point.x() + (out_dx / out_len) * trim,
+                point.y() + (out_dy / out_len) * trim,
+            )
+            path.lineTo(before)
+            path.quadTo(point, after)
+
+        path.lineTo(route[-1])
+        return path
+
+    def curve_between_ports(
+        self,
+        source: PortItem,
+        target: PortItem,
+        lane_hint: int = 0,
+    ) -> QPainterPath:
+        return self.curve_between_points(
+            source.center_scene_pos(), target.center_scene_pos(), lane_hint
+        )
+
+    def curve_drag_preview(
+        self,
+        source: PortItem,
+        end_pos: QPointF,
+    ) -> QPainterPath:
+        return self.curve_between_points(
+            source.center_scene_pos(), end_pos, 0
+        )
+
+    def set_connection_projection(
+        self,
+        projection: list[tuple[str, str, str, str]],
+    ):
+        self._connection_projection = list(projection)
 
     def set_connection_callback(self, callback):
         self._on_connection_made = callback
@@ -425,7 +561,7 @@ class SchematicCanvas(QGraphicsView):
                     or (w.target and w.target.instance_name == instance_name))
             ]
             for w in to_remove:
-                self._remove_wire(w, update_table=False)
+                self._remove_wire(w, notify_removal=False)
             self._scene.removeItem(node)
 
     def clear_all(self):
@@ -438,8 +574,8 @@ class SchematicCanvas(QGraphicsView):
 
     # ── Wire management ───────────────────────────────────
 
-    def sync_wires_from_table(self):
-        """Read the table (source of truth) and redraw all wires. Only in auto mode."""
+    def sync_wires_from_projection(self):
+        """Read the workspace projection and redraw all wires."""
         if self.manual_mode:
             return
 
@@ -448,24 +584,11 @@ class SchematicCanvas(QGraphicsView):
                 self._scene.removeItem(w)
         self._wires.clear()
 
-        if not self._table:
+        if not self._connection_projection:
             return
 
-        from topstitcher.gui.connection_view import (
-            COL_DIR, COL_INSTANCE, COL_PORT, COL_NET,
-        )
         net_map: dict[str, list[tuple[str, str, str]]] = {}
-        for row in range(self._table.rowCount()):
-            inst_item = self._table.item(row, COL_INSTANCE)
-            port_item = self._table.item(row, COL_PORT)
-            dir_item = self._table.item(row, COL_DIR)
-            net_item = self._table.item(row, COL_NET)
-            if not (inst_item and port_item and dir_item and net_item):
-                continue
-            inst = inst_item.text()
-            port = port_item.text()
-            direction = dir_item.text()
-            net = net_item.text().strip()
+        for inst, port, direction, net in self._connection_projection:
             if net:
                 net_map.setdefault(net, []).append((inst, port, direction))
 
@@ -486,7 +609,6 @@ class SchematicCanvas(QGraphicsView):
                 src_inst, src_port, _ = src_entry
                 targets = [p for p in ports if p != src_entry]
             else:
-                # Pure input nets (clk/rst style) should fan out from the leftmost node.
                 src_entry = min(ports, key=endpoint_x)
                 src_inst, src_port, _ = src_entry
                 targets = [p for p in ports if p != src_entry]
@@ -508,21 +630,27 @@ class SchematicCanvas(QGraphicsView):
         self._reroute_all_wires()
 
     def update_wires_for_node(self, node: NodeItem):
-        self._schedule_reroute()
+        for wire in self._wires:
+            if wire.target is None:
+                continue
+            if wire.source.node is node or wire.target.node is node:
+                wire.update_path()
+        if not self._suspend_reroute:
+            self._schedule_reroute()
 
     def delete_selected_wires(self):
-        """Delete all currently selected wires and update the table."""
+        """Delete all currently selected wires and notify the workspace."""
         to_delete = [w for w in self._wires if w.isSelected()]
         for wire in to_delete:
-            self._remove_wire(wire, update_table=True)
+            self._remove_wire(wire, notify_removal=True)
 
-    def _remove_wire(self, wire: WireItem, update_table: bool = True):
-        """Remove a single wire from the scene and optionally clear its net in the table."""
+    def _remove_wire(self, wire: WireItem, notify_removal: bool = True):
+        """Remove a single wire from the scene and optionally notify the workspace."""
         if wire in self._wires:
             self._wires.remove(wire)
         if wire.scene():
             self._scene.removeItem(wire)
-        if update_table and wire.target and self._on_connection_removed:
+        if notify_removal and wire.target and self._on_connection_removed:
             self._on_connection_removed(
                 wire.source.instance_name, wire.source.port_name,
                 wire.target.instance_name, wire.target.port_name,
@@ -533,6 +661,8 @@ class SchematicCanvas(QGraphicsView):
     # ── Context menu ──────────────────────────────────────
 
     def _schedule_reroute(self):
+        if self._suspend_reroute:
+            return
         if self._reroute_pending:
             return
         self._reroute_pending = True
@@ -543,30 +673,8 @@ class SchematicCanvas(QGraphicsView):
         self._reroute_all_wires()
 
     def _reroute_all_wires(self):
-        if not self._wires:
-            return
-
-        blocked = self._blocked_cells()
-        blocked_x = self._blocked_x_intervals()
-        reserved: set[tuple[int, int]] = set()
-        groups = self._group_wires_for_routing()
-        for group in groups:
-            if self._can_route_group_as_bus(group):
-                self._route_bus_group(
-                    group, blocked, blocked_x, reserved,
-                )
-                continue
-            for wire in group:
-                if not wire.target:
-                    continue
-                points, cells = self.route_between_ports(
-                    wire.source, wire.target, exclude_wire=wire,
-                    blocked_cells=blocked, reserved_cells=reserved,
-                    lane_hint=wire._lane_hint,
-                    blocked_x_intervals=blocked_x,
-                )
-                wire.set_route(points, cells)
-                reserved.update(cells)
+        for wire in self._wires:
+            wire.update_path()
 
     def _group_wires_for_routing(self) -> list[list[WireItem]]:
         by_key: dict[tuple[str, str, str], list[WireItem]] = {}
@@ -767,7 +875,7 @@ class SchematicCanvas(QGraphicsView):
         """Find the topmost WireItem near scene_pos."""
         # Use a small area around the cursor for easier clicking on thin wires
         from PyQt6.QtCore import QRectF
-        r = 6
+        r = 8
         area = QRectF(scene_pos.x() - r, scene_pos.y() - r, 2 * r, 2 * r)
         items = self._scene.items(area, Qt.ItemSelectionMode.IntersectsItemShape,
                                   Qt.SortOrder.DescendingOrder)
@@ -815,17 +923,28 @@ class SchematicCanvas(QGraphicsView):
             lane_key = self._lane_key(src, target)
             self._drag_wire._lane_hint = self._next_lane_hint(lane_key)
             self._drag_wire.finalize(target, net_name)
-            self._wires.append(self._drag_wire)
-            self._schedule_reroute()
-            self._drag_wire = None
-            self._drag_source = None
 
+            accepted = True
             if self._on_connection_made:
-                self._on_connection_made(
+                result = self._on_connection_made(
                     src.instance_name, src.port_name,
                     target.instance_name, target.port_name,
                     net_name,
                 )
+                if result is False:
+                    accepted = False
+
+            if not accepted:
+                if self._drag_wire.scene():
+                    self._scene.removeItem(self._drag_wire)
+                self._drag_wire = None
+                self._drag_source = None
+                return
+
+            self._wires.append(self._drag_wire)
+            self._schedule_reroute()
+            self._drag_wire = None
+            self._drag_source = None
         else:
             self._cancel_drag()
 
@@ -1087,6 +1206,17 @@ class SchematicCanvas(QGraphicsView):
             if blocked_x_intervals is not None
             else self._blocked_x_intervals()
         )
+        if abs(start.x() - end.x()) < PORT_ANCHOR_OFFSET * 2:
+            simple_trunk_x = self._select_trunk_x(
+                start_anchor, end_anchor, blocked_x, lane_hint,
+                prefer_forward=False,
+            )
+            simple_points = self._compose_lane_route_points(
+                start, start_anchor, end_anchor, end, simple_trunk_x
+            )
+            simple_cells = self._orthogonal_cells_from_points(simple_points)
+            if self._blocked_conflicts(simple_cells, blocked, start_anchor, end_anchor) == 0:
+                return simple_points, simple_cells
         reserved_halo = self._expanded_cells(reserved, RESERVED_HALO_RADIUS)
 
         best_points: list[QPointF] | None = None
@@ -1194,6 +1324,43 @@ class SchematicCanvas(QGraphicsView):
 
         return points, cells
 
+    def _trim_endpoint_loops(
+        self,
+        cells: list[tuple[int, int]],
+        start_anchor: QPointF,
+        end_anchor: QPointF,
+    ) -> list[tuple[int, int]]:
+        if len(cells) < 5:
+            return cells
+
+        start_cell = self._scene_to_grid(start_anchor)
+        end_cell = self._scene_to_grid(end_anchor)
+        result = list(cells)
+
+        changed = True
+        while changed and len(result) >= 5:
+            changed = False
+
+            if result[0] == start_cell and result[1] != start_cell and result[2] == start_cell:
+                result = [result[0]] + result[3:]
+                changed = True
+                continue
+            if result[0] == start_cell and result[1] == result[3]:
+                result = [result[0]] + result[4:]
+                changed = True
+                continue
+
+            if result[-1] == end_cell and result[-2] != end_cell and result[-3] == end_cell:
+                result = result[:-3] + [result[-1]]
+                changed = True
+                continue
+            if result[-1] == end_cell and result[-2] == result[-4]:
+                result = result[:-4] + [result[-1]]
+                changed = True
+                continue
+
+        return result
+
     def _compose_route_points(
         self,
         start: QPointF,
@@ -1218,7 +1385,10 @@ class SchematicCanvas(QGraphicsView):
             add_point(QPointF(start_anchor.x(), start.y()))
         add_point(start_anchor)
 
-        grid_points = [self._grid_to_scene(cell) for cell in cells]
+        grid_points = [
+            self._grid_to_scene(cell)
+            for cell in self._trim_endpoint_loops(cells, start_anchor, end_anchor)
+        ]
         if grid_points:
             for point in grid_points[1:-1]:
                 add_point(point)
@@ -1518,6 +1688,17 @@ class SchematicCanvas(QGraphicsView):
             return
         super().keyPressEvent(event)
 
+    def mousePressEvent(self, event: QMouseEvent):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._suspend_reroute = True
+        super().mousePressEvent(event)
+
+    def mouseReleaseEvent(self, event: QMouseEvent):
+        super().mouseReleaseEvent(event)
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._suspend_reroute = False
+            self._schedule_reroute()
+
     # ── Zoom ──────────────────────────────────────────────
 
     def wheelEvent(self, event: QWheelEvent):
@@ -1540,7 +1721,7 @@ class SchematicCanvas(QGraphicsView):
         Step B: Assign levels via topological sort (with cycle-break fail-safe).
         Step C: Calculate (X, Y) coordinates and animate nodes.
         """
-        if not self._nodes or not self._table:
+        if not self._nodes or not self._connection_projection:
             return
 
         # Step A
@@ -1558,26 +1739,9 @@ class SchematicCanvas(QGraphicsView):
     # ── Step A: Dependency Graph ──────────────────────────
 
     def _build_dependency_graph(self) -> dict[str, set[str]]:
-        """Analyse the table to create inst_A → inst_B edges.
-
-        An edge exists when an *output* of A shares a net name with
-        an *input* of B.
-        """
-        from topstitcher.gui.connection_view import (
-            COL_INSTANCE, COL_DIR, COL_NET,
-        )
-
-        # net_name → [(instance_name, direction_str)]
+        """Analyse the workspace projection to create inst_A → inst_B edges."""
         net_map: dict[str, list[tuple[str, str]]] = {}
-        for row in range(self._table.rowCount()):
-            inst_item = self._table.item(row, COL_INSTANCE)
-            dir_item = self._table.item(row, COL_DIR)
-            net_item = self._table.item(row, COL_NET)
-            if not (inst_item and dir_item and net_item):
-                continue
-            inst = inst_item.text()
-            direction = dir_item.text()
-            net = net_item.text().strip()
+        for inst, _port, direction, net in self._connection_projection:
             if net:
                 net_map.setdefault(net, []).append((inst, direction))
 

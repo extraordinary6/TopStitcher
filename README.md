@@ -1,198 +1,328 @@
 # TopStitcher
 
-A graphical RTL integration assistant tool for IC designers, built with Python and PyQt6. TopStitcher automates the generation of top-level Verilog modules by parsing sub-module `.v` files, intelligently resolving inter-module connections, and outputting synthesizable, professionally formatted Verilog code.
+TopStitcher is a PyQt6-based manual-first RTL integration workspace for building top-level Verilog modules from existing submodules.
 
-Inspired by Vivado IP Integrator's block design workflow, TopStitcher provides both a netlist table and an interactive schematic canvas for visual block-level routing.
+Current version: **3.0.0**
 
-## Features
+## What changed in this version
 
-### Smart Auto-Connection Engine
-- **Direction-Aware Rule A**: Automatically connects same-name ports across instances when direction compatibility is verified (output drives input). Detects and flags multi-output conflicts.
-- **Width Mismatch Tolerance**: Ports with matching names but different widths are still connected (using the larger width), with a visible `Width Mismatch` warning.
-- **Suggested Connections**: After rule-based matching, the engine scans remaining ports and suggests output-to-input links when there is exactly one unambiguous candidate.
-- **Rule B Fallback**: Unmatched ports are promoted to top-level I/O with automatic name deduplication.
+This project no longer uses the old RuleA/RuleB workflow where import immediately auto-connected ports and auto-promoted leftover ports to top-level IO.
 
-### Interactive Schematic Canvas
-A `QGraphicsView`-based visual block design editor:
-- **Node Blocks**: Each instance is rendered as a movable block with input ports on the left edge and output ports on the right edge, color-coded by direction.
-- **Wire Routing**: Draw connections by dragging from one port to another. Wires render as smooth cubic Bezier curves.
-- **Wire Deletion**: Select a wire (highlights red) and press `Delete`, use the right-click context menu, or click the toolbar button.
-- **Auto / Manual Mode Toggle**:
-  - **Auto-Wiring** (default): Wires are synchronized from the Netlist Table automatically. The canvas is a read-only visualization of the current connection state.
-  - **Manual Wiring**: Clear all auto-generated wires and draw connections by hand. Each drawn or deleted wire updates the Netlist Table in real time.
-- **Sync from Table**: One-click button to re-render all wires from the table at any time.
-- **Zoom**: Mouse wheel to zoom in/out.
+The current model is:
 
-### Netlist Table (Source of Truth)
-An interactive `QTableWidget` drives all connection data:
-- Columns: Instance Name, Port Name, Direction, Width, **Assigned Net** (editable), Status.
-- Ports sharing the same Assigned Net string are automatically tied via a `wire`.
-- **Promote / Demote** controls to force specific ports as top-level I/O (reversible).
-- Bi-directional sync with the Schematic Canvas.
+- import modules
+- create instances
+- initialize a **manual-first workspace**
+- explicitly use:
+  - `Connect`
+  - `Disconnect`
+  - `Auto IO`
+  - `Auto Connect`
+- generate Verilog from the workspace state
 
-### Global Signal Management
-Configurable global signal list (default: `clk`, `rst_n`, etc.) ensures clock and reset signals are always promoted to top-level inputs, never buried as internal wires.
+The workspace is now the single source of truth.
 
-### Multiple Instantiation
-The same parsed module can be instantiated multiple times with unique instance names. The Module Library and Active Instances are fully decoupled.
+## Core concepts
 
-### Parameter Support
-- Parses `parameter` declarations from both ANSI-style `#(...)` and old-style module bodies.
-- Supports complex default value expressions (`$clog2(N)`, `A + 1`, etc.).
-- Generates `#(.PARAM(value), ...)` blocks in instantiation code.
-- Editable parameter values per instance via the GUI.
+### DesignWorkspace
+The main runtime state for a design.
 
-### Diagnostics & Visual Feedback
-The Status column provides color-coded indicators:
+Contains:
+- instances
+- nets
+- `port_to_net` mapping
 
-| Status | Color | Meaning |
-|---|---|---|
-| Global | Blue | Clock/reset promoted to top-level input |
-| Promoted | Orange | User-forced top-level port |
-| Suggested | Green | Engine-suggested output-to-input connection |
-| Width Mismatch | Yellow | Connected despite different bit widths |
-| Multi-Driver | Red | Multiple outputs driving the same net |
-| Undriven | Amber | Net has only inputs, no driver |
-| Conflict | Red | All-output name collision, not auto-connected |
+### Net types
+Every net has a real type:
+- `WIRE`
+- `INPUT`
+- `OUTPUT`
 
-### Professional Code Generation
-- ANSI-style module declaration with vertically aligned ports.
-- Aligned `.port_name(net_name)` formatting in instantiation blocks.
-- Aligned parameter blocks `#(.PARAM(value))`.
-- `timescale` directive and header comments.
-- Round-trip verified: generated code is parseable by PyVerilog.
+This means top-level IO is now a net property, not a side flag.
 
-## Project Structure
+### PortRef
+Ports are addressed explicitly as:
+- `(instance_name, port_name)`
 
-```
+Top-level pseudo endpoints are also supported internally so that:
+- top input -> instance input
+- instance output -> top output
+
+can be expressed explicitly.
+
+## Main features
+
+### 1. Manual-first workspace initialization
+On import / instance refresh:
+- no automatic connection
+- no automatic top-level IO promotion
+- every instance port starts on its own singleton `WIRE` net
+- default net names use `{instance}_{port}`
+
+### 2. Three-column workspace editor
+The main workspace UI is organized as:
+
+- **Left**
+  - instance inputs
+  - top outputs
+- **Center**
+  - `Connect`
+  - `Disconnect`
+  - `Auto IO`
+  - `Auto Connect`
+  - `Rename Net`
+- **Right**
+  - instance outputs
+  - top inputs
+- **Inout**
+  - shown separately
+
+### 3. Explicit actions
+
+#### Connect
+Allowed pairs:
+- `output -> input`
+- `top input -> instance input`
+- `instance output -> top output`
+
+Behavior:
+- merges two nets into one
+- default merged net name is derived from endpoints
+- width mismatch is allowed
+- resulting net width uses the larger width
+- width mismatch warning is attached
+
+#### Disconnect
+Behavior:
+- disconnects only the selected pair
+- if the net has only 2 ports, both return to singleton nets
+- if the net has more ports, only the selected receiver side is detached
+- top-level pseudo endpoint disconnect keeps the top IO net and detaches the instance port back to a `WIRE` net
+
+#### Auto IO
+Behavior:
+- on instance input: net becomes `INPUT`
+- on instance output: net becomes `OUTPUT`
+- corresponding top IO appears on the opposite side of the workspace
+
+#### Auto Connect
+Behavior:
+- explicit command only
+- does not run on import
+- only connects same-name, same-width ports
+- parameterized widths only connect when expressions match exactly
+- does not connect `inout`
+- does not promote top IO
+
+### 4. Workspace-driven Verilog generation
+Generation rules:
+- `WIRE` nets -> internal wires
+- `INPUT` / `OUTPUT` nets -> top ports
+- singleton wires stay wires
+- no leftover-port auto-promotion
+
+### 5. Workspace-driven schematic canvas
+The schematic canvas now:
+- displays workspace projections
+- routes wires from workspace state
+- performs connect/disconnect through workspace actions
+- is no longer driven by the debug table
+
+## Project structure
+
+```text
 TopStitcher/
-├── main.py                              # Application entry point
-├── requirements.txt                     # pyverilog, PyQt6
+├── main.py
+├── requirements.txt
+├── README.md
 ├── topstitcher/
+│   ├── __init__.py
 │   ├── core/
-│   │   ├── data_model.py               # Dataclasses: PortInfo, ModuleInfo, InstanceInfo, etc.
-│   │   ├── rtl_parser.py               # PyVerilog-based parser (ANSI + old-style + parameters)
-│   │   ├── connection_engine.py         # Smart connection engine with diagnostics
-│   │   └── verilog_generator.py         # Aligned Verilog code generator
+│   │   ├── data_model.py
+│   │   ├── rtl_parser.py
+│   │   ├── connection_engine.py
+│   │   └── verilog_generator.py
 │   └── gui/
-│       ├── main_window.py              # Main window layout and event handling
-│       ├── module_tree.py              # Module Library + Active Instances panel
-│       ├── connection_view.py          # Tabbed workspace (table + canvas + parameters)
-│       ├── schematic_canvas.py         # QGraphicsView block design canvas
-│       └── code_preview_dialog.py      # Code preview with Save/Copy
+│       ├── main_window.py
+│       ├── module_tree.py
+│       ├── connection_view.py
+│       ├── schematic_canvas.py
+│       └── code_preview_dialog.py
 └── tests/
-    ├── test_data/                       # Sample Verilog files (adder, register, param_adder)
     ├── test_rtl_parser.py
     ├── test_connection_engine.py
-    └── test_verilog_generator.py
+    ├── test_verilog_generator.py
+    └── test_gui_smoke.py
 ```
 
-## Quick Start
+## Dependencies
 
-### Install Dependencies
+From `requirements.txt`:
+
+- `pyverilog>=1.3.0`
+- `PyQt6>=6.5.0`
+
+For tests:
+- `pytest`
+
+## Recommended Python environment
+You asked to verify GUI tests with:
 
 ```bash
-pip install pyverilog PyQt6
+D:/anaconda/envs/pytorch/python.exe
 ```
 
-### Run
+That environment successfully ran the GUI smoke test.
+
+## Installation
+
+### Option A: pip
+
+```bash
+pip install -r requirements.txt
+pip install pytest
+```
+
+### Option B: use the verified conda environment
+
+```bash
+D:/anaconda/envs/pytorch/python.exe -m pip install -r requirements.txt
+D:/anaconda/envs/pytorch/python.exe -m pip install pytest
+```
+
+## Run the application
+
+### Default
 
 ```bash
 python main.py
 ```
 
-### Workflow
-
-1. **File > Import Verilog Files** (Ctrl+O) -- select one or more `.v` files.
-2. The Module Library tree and Active Instances list are populated automatically.
-3. The **Netlist Table** tab auto-fills with default assignments (Rule A/B + suggestions).
-4. Review the **Status** column for warnings. Edit **Assigned Net** values as needed.
-5. Switch to the **Schematic Canvas** tab to visualize the block diagram.
-   - Toggle to **Manual Wiring** mode to draw or delete wires by hand.
-   - Or stay in **Auto-Wiring** mode to view the current table state.
-6. Adjust **Instance Parameters** in the third tab if needed.
-7. Click **Generate Top Module** (Ctrl+G) to preview the output.
-8. **Save As** or **Copy to Clipboard** from the preview dialog.
-
-### Run Tests
+### With the verified environment
 
 ```bash
-pip install pytest
-python -m pytest tests/ -v
+D:/anaconda/envs/pytorch/python.exe main.py
 ```
 
-## GUI Controls
+## Run tests
 
-### Main Window
+### Core + generator + GUI smoke
 
-| Control | Description |
-|---|---|
-| Top Module Name | Editable name for the generated module |
-| Global Signals | Comma-separated list of signals to promote as top-level inputs |
-| Add Instance | Instantiate a selected library module with a custom name |
-| Remove Instance | Remove an instance from the active design |
-| Promote Selected to Top (Ctrl+P) | Force selected ports as top-level I/O |
-| Demote Selected (Ctrl+D) | Revert promoted ports back to auto-connection |
-| Re-run Auto-Connect (Ctrl+R) | Recompute all assignments (preserves parameter edits) |
-| Generate Top Module (Ctrl+G) | Generate and preview Verilog output |
-
-### Schematic Canvas Toolbar
-
-| Control | Description |
-|---|---|
-| Mode: Auto-Wiring / Manual Wiring | Toggle between auto-sync from table and manual wire drawing |
-| Sync from Table | Force re-draw all wires from the Netlist Table |
-| Delete Selected Wire | Remove the selected wire(s) and update the table |
-
-### Schematic Canvas Interactions
-
-| Action | Effect |
-|---|---|
-| Drag from port to port (Manual mode) | Draw a new wire, updates the Netlist Table |
-| Click a wire | Select it (highlights red) |
-| Delete / Backspace | Delete selected wire(s) |
-| Right-click a wire | Context menu with Delete option |
-| Drag a node block | Move the block, wires follow automatically |
-| Mouse wheel | Zoom in / out |
-
-## Example Output
-
-```verilog
-`timescale 1ns / 1ps
-
-module chip_top (
-    input        clk,
-    input  [7:0] a,
-    input  [7:0] b,
-    input        rst_n,
-    output [7:0] q
-);
-
-// Internal wires
-wire [7:0] sum_to_d;
-
-// adder instance
-adder #(
-    .WIDTH(8)
-) u_adder (
-    .clk  (clk      ),
-    .rst_n(rst_n     ),
-    .a    (a         ),
-    .b    (b         ),
-    .sum  (sum_to_d  )
-);
-
-// register instance
-register u_register (
-    .clk  (clk      ),
-    .rst_n(rst_n     ),
-    .d    (sum_to_d  ),
-    .q    (q         )
-);
-
-endmodule
+```bash
+D:/anaconda/envs/pytorch/python.exe -m pytest tests/test_connection_engine.py tests/test_verilog_generator.py tests/test_gui_smoke.py -v
 ```
+
+### Full suite
+
+```bash
+D:/anaconda/envs/pytorch/python.exe -m pytest tests -v
+```
+
+## How to use the project now
+
+### Step 1: start the app
+
+Run:
+
+```bash
+D:/anaconda/envs/pytorch/python.exe main.py
+```
+
+### Step 2: import Verilog files
+
+Use:
+- `File -> Import Verilog Files...`
+- or `Ctrl+O`
+
+TopStitcher will:
+- parse all selected modules
+- populate the module library
+- auto-create one instance per imported module
+- initialize a manual-first workspace
+
+It will **not** auto-connect ports and **not** auto-promote ports to top-level IO.
+
+### Step 3: inspect the workspace
+
+In the **Workspace** tab:
+- left side shows instance inputs and top outputs
+- right side shows instance outputs and top inputs
+- `Inout` is shown separately
+
+### Step 4: build the design explicitly
+
+Use the center actions:
+
+#### Connect
+- select one endpoint on the left
+- select one endpoint on the right
+- click `Connect`
+
+#### Disconnect
+- select the currently connected pair
+- click `Disconnect`
+
+#### Auto IO
+- select one instance input or output
+- click `Auto IO`
+- this changes the underlying net type to `INPUT` or `OUTPUT`
+
+#### Auto Connect
+- click `Auto Connect`
+- this only connects same-name, same-width ports
+
+#### Rename Net
+- select any endpoint
+- type the new net name in the center panel
+- click `Rename Selected Net`
+
+### Step 5: review debug / visual projections if needed
+
+Optional tabs:
+- **Netlist Table (Debug)**: flattened workspace projection
+- **Schematic Canvas**: visual view and wiring interaction
+- **Instance Parameters**: per-instance parameter editing
+
+### Step 6: generate Verilog
+
+Use:
+- `Generate -> Generate Top Module`
+- or `Ctrl+G`
+
+This opens a preview dialog where you can:
+- inspect generated Verilog
+- copy to clipboard
+- save to file
+
+## Current UI workflow summary
+
+- bottom shortcut buttons are still present for convenience
+- the primary interaction model is the **center action panel** in the Workspace tab
+
+## Notes on project conventions
+
+### Versioning
+There was no formal packaging metadata in the repo (`pyproject.toml`, `setup.py`, `setup.cfg` are absent), so the safest cleanup was to add a single source version constant:
+
+- `topstitcher/__init__.py`
+  - `__version__ = "3.0.0"`
+
+### Naming / product semantics
+The codebase previously had mixed legacy labels like `V2`, `V5`, `automatic generator`, and older RuleA/RuleB language.
+
+This cleanup aligns the visible product description with the current behavior:
+- manual-first workspace
+- explicit actions
+- workspace-driven generation
+
+There may still be some historical names in comments or old test descriptions, but the user-facing workflow is now aligned.
+
+## Known limitations
+
+- the canvas still visualizes instance nodes only; top-level pseudo endpoints are represented in the workspace UI and core model, not as separate canvas nodes
+- the debug table still exists as a projection view for inspection/debugging
+- packaging metadata is still not set up as an installable package release system
 
 ## License
 
-See [LICENSE](LICENSE) for details.
+See `LICENSE`.

@@ -1,4 +1,4 @@
-"""Tests for RTL parser (V2: ModuleInfo no longer has instance_name)."""
+"""Tests for the RTL parser."""
 
 import os
 import pytest
@@ -64,7 +64,7 @@ class TestMultipleFiles:
         assert names == {"adder", "register"}
 
     def test_no_instance_name_on_module(self, parser):
-        """V2: ModuleInfo is a library entry, no instance_name."""
+        """ModuleInfo is a library entry, not an instance."""
         modules = parser.parse_files([os.path.join(TEST_DATA, "adder.v")])
         assert not hasattr(modules[0], "instance_name") or modules[0].source_file
 

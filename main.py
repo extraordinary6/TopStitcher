@@ -1,4 +1,4 @@
-"""TopStitcher - Verilog Top Module Generator."""
+"""TopStitcher application entry point."""
 
 import sys
 import logging

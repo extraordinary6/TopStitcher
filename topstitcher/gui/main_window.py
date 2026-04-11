@@ -1,4 +1,4 @@
-"""Main window for TopStitcher V2."""
+"""Main window for the manual-first TopStitcher workspace."""
 
 import logging
 
@@ -11,9 +11,9 @@ from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QAction, QKeySequence
 
 from topstitcher.core.rtl_parser import RtlParser
-from topstitcher.core.connection_engine import ConnectionEngine, DEFAULT_GLOBAL_SIGNALS
+from topstitcher.core.connection_engine import ConnectionEngine
 from topstitcher.core.verilog_generator import VerilogGenerator
-from topstitcher.core.data_model import PortAssignment, InstanceInfo
+from topstitcher.core.data_model import InstanceInfo, DesignWorkspace
 from topstitcher.gui.module_tree import ModuleTreeWidget
 from topstitcher.gui.connection_view import ConnectionViewWidget
 from topstitcher.gui.code_preview_dialog import CodePreviewDialog
@@ -24,14 +24,14 @@ logger = logging.getLogger(__name__)
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("TopStitcher V5 - Verilog Top Module Generator")
+        self.setWindowTitle("TopStitcher - Manual-First Connection Workspace")
         self.resize(1200, 700)
 
         self.parser = RtlParser()
         self.engine = ConnectionEngine()
         self.generator = VerilogGenerator()
 
-        self._promoted_ports: set[tuple[str, str]] = set()
+        self.workspace = DesignWorkspace()
 
         self._setup_menu()
         self._setup_ui()
@@ -65,19 +65,24 @@ class MainWindow(QMainWindow):
         gen_menu.addAction(gen_action)
 
         edit_menu = menubar.addMenu("&Edit")
-        rerun_action = QAction("&Re-run Auto-Connect", self)
+        connect_action = QAction("&Connect Selected", self)
+        connect_action.setShortcut(QKeySequence("Ctrl+L"))
+        connect_action.triggered.connect(self._on_connect_selected)
+        edit_menu.addAction(connect_action)
+
+        rerun_action = QAction("&Auto Connect", self)
         rerun_action.setShortcut(QKeySequence("Ctrl+R"))
         rerun_action.triggered.connect(self._on_rerun_auto)
         edit_menu.addAction(rerun_action)
 
         edit_menu.addSeparator()
 
-        promote_action = QAction("&Promote Selected to Top", self)
+        promote_action = QAction("&Auto IO for Selected", self)
         promote_action.setShortcut(QKeySequence("Ctrl+P"))
         promote_action.triggered.connect(self._on_promote_selected)
         edit_menu.addAction(promote_action)
 
-        demote_action = QAction("&Demote Selected from Top", self)
+        demote_action = QAction("&Disconnect Selected", self)
         demote_action.setShortcut(QKeySequence("Ctrl+D"))
         demote_action.triggered.connect(self._on_demote_selected)
         edit_menu.addAction(demote_action)
@@ -103,13 +108,9 @@ class MainWindow(QMainWindow):
         self.top_name_edit.setMaximumWidth(200)
         ctrl_layout.addWidget(self.top_name_edit)
 
-        ctrl_layout.addWidget(QLabel("Global Signals (comma-separated):"))
-        self.global_signals_edit = QLineEdit(", ".join(DEFAULT_GLOBAL_SIGNALS))
-        ctrl_layout.addWidget(self.global_signals_edit)
-
         main_layout.addWidget(controls)
 
-        # Main splitter: left (module library + instances) | right (connection table)
+        # Main splitter: left library/instances | right workspace editor
         splitter = QSplitter(Qt.Orientation.Horizontal)
 
         self.module_tree = ModuleTreeWidget()
@@ -117,25 +118,37 @@ class MainWindow(QMainWindow):
         splitter.addWidget(self.module_tree)
 
         self.connection_view = ConnectionViewWidget()
+        self.connection_view.set_rename_callback(self._on_rename_net)
+        self.connection_view.set_connect_action_callback(self._on_connect_selected)
+        self.connection_view.set_disconnect_action_callback(self._on_disconnect_selected)
+        self.connection_view.set_auto_io_action_callback(self._on_auto_io_selected)
+        self.connection_view.set_auto_connect_action_callback(self._on_rerun_auto)
+        self.connection_view.set_connect_callback(self._on_canvas_connect)
+        self.connection_view.set_disconnect_callback(self._on_canvas_disconnect)
         splitter.addWidget(self.connection_view)
 
         splitter.setStretchFactor(0, 3)
         splitter.setStretchFactor(1, 7)
         main_layout.addWidget(splitter)
 
-        # Bottom buttons
+        # Legacy shortcut buttons; core actions live in the workspace center panel
         btn_row = QHBoxLayout()
-        self.rerun_btn = QPushButton("Re-run Auto-Connect")
+        self.connect_btn = QPushButton("Connect Selected")
+        self.connect_btn.setEnabled(False)
+        self.connect_btn.clicked.connect(self._on_connect_selected)
+        btn_row.addWidget(self.connect_btn)
+
+        self.rerun_btn = QPushButton("Auto Connect")
         self.rerun_btn.setEnabled(False)
         self.rerun_btn.clicked.connect(self._on_rerun_auto)
         btn_row.addWidget(self.rerun_btn)
 
-        self.promote_btn = QPushButton("Promote Selected to Top")
+        self.promote_btn = QPushButton("Auto IO for Selected")
         self.promote_btn.setEnabled(False)
         self.promote_btn.clicked.connect(self._on_promote_selected)
         btn_row.addWidget(self.promote_btn)
 
-        self.demote_btn = QPushButton("Demote Selected")
+        self.demote_btn = QPushButton("Disconnect Selected")
         self.demote_btn.setEnabled(False)
         self.demote_btn.clicked.connect(self._on_demote_selected)
         btn_row.addWidget(self.demote_btn)
@@ -156,46 +169,30 @@ class MainWindow(QMainWindow):
 
     # ── Helpers ────────────────────────────────────────────────────
 
-    def _get_global_signals(self) -> list[str]:
-        text = self.global_signals_edit.text().strip()
-        if not text:
-            return []
-        return [s.strip() for s in text.split(",") if s.strip()]
+    def _refresh_workspace_view(self, reload_canvas_instances: bool = False):
+        assignments = self.engine.flatten_workspace(self.workspace)
+        instances = self.module_tree.get_instances()
+        self.connection_view.load_assignments(assignments, self.workspace)
+        self.connection_view.load_parameters(instances)
+        if reload_canvas_instances:
+            self.connection_view.load_instances_to_canvas(instances)
+        self._update_buttons(bool(instances))
+
+        warnings = sum(len(net.warnings) for net in self.workspace.nets.values())
+        self.status_bar.showMessage(
+            f"Workspace ready: {len(instances)} instance(s), "
+            f"{len(self.workspace.nets)} net(s), {warnings} warning(s)."
+        )
 
     def _run_auto_connect(self):
-        instances = self.module_tree.get_instances()
-        if not instances:
+        if not self.workspace.instances:
             return
 
-        # Preserve any user-edited parameter values before reloading
+        instances = self.module_tree.get_instances()
         self._apply_edited_params(instances)
-
-        global_sigs = self._get_global_signals()
-        assignments = self.engine.build_assignments(
-            instances, global_sigs, self._promoted_ports,
-        )
-        self.connection_view.load_assignments(assignments)
-        self.connection_view.load_parameters(instances)
-        self.connection_view.load_instances_to_canvas(instances)
-        self._update_buttons(True)
-
-        # Count diagnostics for status bar
-        n_params = sum(len(i.params) for i in instances)
-        warnings = sum(1 for a in assignments if a.status and any(
-            tag in a.status for tag in ("Multi-Driver", "Undriven", "Conflict", "Width Mismatch")
-        ))
-        suggested = sum(1 for a in assignments if "Suggested" in a.status)
-        parts = [
-            f"{len(instances)} instance(s)",
-            f"{len(assignments)} port(s)",
-        ]
-        if n_params:
-            parts.append(f"{n_params} param(s)")
-        if suggested:
-            parts.append(f"{suggested} suggested")
-        if warnings:
-            parts.append(f"{warnings} warning(s)")
-        self.status_bar.showMessage("Auto-connected: " + ", ".join(parts) + ".")
+        self.workspace.instances = instances
+        self.engine.auto_connect_same_name_same_width(self.workspace)
+        self._refresh_workspace_view()
 
     def _apply_edited_params(self, instances: list[InstanceInfo]):
         """Read parameter edits from the table and apply to instances."""
@@ -210,22 +207,17 @@ class MainWindow(QMainWindow):
 
     def _update_buttons(self, has_data: bool):
         self.gen_btn.setEnabled(has_data)
+        self.connect_btn.setEnabled(has_data)
         self.rerun_btn.setEnabled(has_data)
         self.promote_btn.setEnabled(has_data)
         self.demote_btn.setEnabled(has_data)
 
     def _get_selected_port_keys(self) -> set[tuple[str, str]]:
-        """Get (instance_name, port_name) for selected rows in port table."""
-        table = self.connection_view.table
-        selected_rows = set(idx.row() for idx in table.selectedIndexes())
-        keys = set()
-        for row in selected_rows:
-            inst = table.item(row, 0).text()
-            port = table.item(row, 1).text()
-            keys.add((inst, port))
-        return keys
+        return self.connection_view.get_selected_instance_port_keys()
 
-    # ── Event Handlers ────────────────────────────────────────────
+    def _make_port_ref(self, instance_name: str, port_name: str):
+        from topstitcher.core.data_model import PortRef
+        return PortRef(instance_name, port_name)
 
     def _on_import_files(self):
         paths, _ = QFileDialog.getOpenFileNames(
@@ -245,57 +237,80 @@ class MainWindow(QMainWindow):
             )
             return
 
-        self._promoted_ports.clear()
+        self.workspace = DesignWorkspace()
+        self.connection_view.clear()
         self.module_tree.load_modules(modules)
-        # instances_changed signal triggers _on_instances_changed → _run_auto_connect
 
     def _on_instances_changed(self):
-        self._run_auto_connect()
+        instances = self.module_tree.get_instances()
+        self._apply_edited_params(instances)
+        self.workspace = self.engine.initialize_workspace(instances)
+        self._refresh_workspace_view(reload_canvas_instances=True)
 
     def _on_rerun_auto(self):
         self._run_auto_connect()
 
-    def _on_promote_selected(self):
-        """Mark selected table rows as promoted-to-top and re-run auto-connect."""
-        keys = self._get_selected_port_keys()
-        if not keys:
+    def _connect_pair(self, left_ref, right_ref) -> None:
+        try:
+            self.engine.connect_ports(self.workspace, left_ref, right_ref)
+            return
+        except ValueError:
+            self.engine.connect_ports(self.workspace, right_ref, left_ref)
+
+    def _on_connect_selected(self):
+        pair = self.connection_view.get_selected_connect_pair()
+        if not pair:
             QMessageBox.information(
-                self, "No Selection",
-                "Select one or more rows in the connection table first."
+                self, "Need Left And Right",
+                "Select one endpoint on the left and one endpoint on the right."
             )
             return
 
-        self._promoted_ports.update(keys)
-        self._run_auto_connect()
-        self.status_bar.showMessage(
-            f"Promoted {len(keys)} port(s) to top-level. "
-            f"Total promoted: {len(self._promoted_ports)}."
-        )
+        try:
+            self._connect_pair(pair[0], pair[1])
+        except ValueError as exc:
+            QMessageBox.warning(self, "Invalid Connection", str(exc))
+            return
+
+        self._refresh_workspace_view()
+        self.status_bar.showMessage("Connected selected ports.")
+
+    def _on_auto_io_selected(self):
+        ref = self.connection_view.get_selected_auto_io_ref()
+        if not ref or ref.instance_name == "__top__":
+            QMessageBox.information(
+                self, "No Selection",
+                "Select one instance port for Auto IO."
+            )
+            return
+
+        self.engine.auto_io(self.workspace, ref)
+        self._refresh_workspace_view()
+        self.status_bar.showMessage("Auto IO applied to selected port.")
+
+    def _on_promote_selected(self):
+        self._on_auto_io_selected()
+
+    def _on_disconnect_selected(self):
+        pair = self.connection_view.get_selected_disconnect_pair()
+        if not pair:
+            QMessageBox.information(
+                self, "Need Left And Right",
+                "Select one endpoint on the left and one endpoint on the right."
+            )
+            return
+
+        self.engine.disconnect_ports(self.workspace, pair[0], pair[1])
+        self._refresh_workspace_view()
+        self.status_bar.showMessage("Disconnected selected endpoints.")
 
     def _on_demote_selected(self):
-        """Remove selected table rows from the promoted set and re-run."""
-        keys = self._get_selected_port_keys()
-        if not keys:
-            QMessageBox.information(
-                self, "No Selection",
-                "Select one or more rows in the connection table first."
-            )
-            return
+        self._on_disconnect_selected()
 
-        removed = keys & self._promoted_ports
-        if not removed:
-            QMessageBox.information(
-                self, "Nothing to Demote",
-                "The selected port(s) are not currently promoted."
-            )
-            return
-
-        self._promoted_ports -= removed
-        self._run_auto_connect()
-        self.status_bar.showMessage(
-            f"Demoted {len(removed)} port(s). "
-            f"Remaining promoted: {len(self._promoted_ports)}."
-        )
+    def _on_rename_net(self, port_ref, new_name: str):
+        self.engine.rename_net(self.workspace, port_ref, new_name)
+        self._refresh_workspace_view()
+        self.status_bar.showMessage(f"Renamed net to {new_name}.")
 
     def _on_generate(self):
         instances = self.module_tree.get_instances()
@@ -303,52 +318,44 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "No Instances", "Add instances first.")
             return
 
-        # Apply edited parameter values from the parameter table
         self._apply_edited_params(instances)
-
-        # Read final state from the interactive port table
-        assignments = self.connection_view.read_assignments()
-        inst_map = {i.instance_name: i.module_name for i in instances}
-        for a in assignments:
-            if not a.module_name:
-                a.module_name = inst_map.get(a.instance_name, "")
-            for inst in instances:
-                if inst.instance_name == a.instance_name:
-                    for p in inst.ports:
-                        if p.name == a.port_name:
-                            a.msb_expr = p.msb_expr
-                            a.lsb_expr = p.lsb_expr
-                            a.width = p.width
-                            break
-                    break
+        self.workspace.instances = instances
 
         module_name = self.top_name_edit.text().strip() or "top_module"
-        global_sigs = self._get_global_signals()
-
-        code = self.generator.generate_from_table(
-            module_name, instances, assignments,
-            global_sigs, self._promoted_ports,
-        )
+        code = self.generator.generate_from_workspace(module_name, self.workspace)
         dialog = CodePreviewDialog(code, self)
         dialog.exec()
+
+    def _on_canvas_connect(self, left_ref, right_ref):
+        try:
+            self._connect_pair(left_ref, right_ref)
+        except ValueError as exc:
+            QMessageBox.warning(self, "Invalid Connection", str(exc))
+            self._refresh_workspace_view()
+            return False
+        self._refresh_workspace_view()
+        return True
+
+    def _on_canvas_disconnect(self, left_ref, right_ref):
+        self.engine.disconnect_ports(self.workspace, left_ref, right_ref)
+        self._refresh_workspace_view()
 
     def _on_clear(self):
         self.module_tree.clear()
         self.connection_view.clear()
-        self._promoted_ports.clear()
+        self.workspace = DesignWorkspace()
         self._update_buttons(False)
         self.status_bar.showMessage("Cleared. Import Verilog files to begin.")
 
     def _on_about(self):
         QMessageBox.about(
             self, "About TopStitcher",
-            "TopStitcher V5\n\n"
-            "Automatic Verilog top-level module generator\n"
-            "with manual override support.\n\n"
+            "TopStitcher\n\n"
+            "Manual-first Verilog top module workspace.\n\n"
             "Features:\n"
-            "- Global signal promotion\n"
-            "- Multiple instantiation\n"
-            "- Interactive connection table\n"
-            "- Top module customization\n"
-            "- Parameter editing"
+            "- Explicit Connect / Disconnect\n"
+            "- Auto IO promotion by net type\n"
+            "- Explicit Auto Connect\n"
+            "- Three-column workspace editor\n"
+            "- Schematic canvas and parameter editing"
         )

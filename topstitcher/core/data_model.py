@@ -1,4 +1,4 @@
-"""Data models for TopStitcher V2."""
+"""Data models for TopStitcher."""
 
 from dataclasses import dataclass, field
 from enum import Enum
@@ -15,6 +15,15 @@ class PortDirection(Enum):
 class ConnectionType(Enum):
     INTERNAL_WIRE = "internal_wire"
     TOP_LEVEL_PORT = "top_level_port"
+
+
+TOP_LEVEL_INSTANCE = "__top__"
+
+
+class NetType(Enum):
+    WIRE = "wire"
+    INPUT = "input"
+    OUTPUT = "output"
 
 
 @dataclass
@@ -66,6 +75,37 @@ class InstanceInfo:
         )
 
 
+@dataclass(frozen=True)
+class PortRef:
+    instance_name: str
+    port_name: str
+
+
+@dataclass
+class NetRecord:
+    net_id: str
+    net_name: str
+    net_type: NetType
+    width: int
+    msb_expr: str
+    lsb_expr: str
+    connected_ports: list[PortRef] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
+
+    @property
+    def range_str(self) -> str:
+        if self.width == 1:
+            return ""
+        return f"[{self.msb_expr}:{self.lsb_expr}]"
+
+
+@dataclass
+class DesignWorkspace:
+    instances: list[InstanceInfo] = field(default_factory=list)
+    nets: dict[str, NetRecord] = field(default_factory=dict)
+    port_to_net: dict[PortRef, str] = field(default_factory=dict)
+
+
 @dataclass
 class PortAssignment:
     """One row in the interactive connection table."""
@@ -77,7 +117,7 @@ class PortAssignment:
     msb_expr: str
     lsb_expr: str
     assigned_net: str  # editable by user
-    status: str = ""   # e.g. "Global", "Promoted", "Suggested", "Width Mismatch", etc.
+    status: str = ""
 
     @property
     def range_str(self) -> str:
@@ -117,7 +157,6 @@ class TopModuleDesign:
     internal_wires: list[Connection] = field(default_factory=list)
     top_ports: list[Connection] = field(default_factory=list)
 
-    # V1 compat alias
     @property
     def sub_modules(self) -> list:
         return self.instances

@@ -166,13 +166,13 @@ For tests:
 - `pytest`
 
 ## Recommended Python environment
-You asked to verify GUI tests with:
+A verified example Python interpreter path:
 
 ```bash
-D:/anaconda/envs/pytorch/python.exe
+<path-to-your-python>/python.exe
 ```
 
-That environment successfully ran the GUI smoke test.
+This environment format successfully ran the GUI smoke test.
 
 ## Installation
 
@@ -183,11 +183,11 @@ pip install -r requirements.txt
 pip install pytest
 ```
 
-### Option B: use the verified conda environment
+### Option B: use a conda environment
 
 ```bash
-D:/anaconda/envs/pytorch/python.exe -m pip install -r requirements.txt
-D:/anaconda/envs/pytorch/python.exe -m pip install pytest
+<path-to-your-python>/python.exe -m pip install -r requirements.txt
+<path-to-your-python>/python.exe -m pip install pytest
 ```
 
 ## Run the application
@@ -198,10 +198,10 @@ D:/anaconda/envs/pytorch/python.exe -m pip install pytest
 python main.py
 ```
 
-### With the verified environment
+### With a specified environment
 
 ```bash
-D:/anaconda/envs/pytorch/python.exe main.py
+<path-to-your-python>/python.exe main.py
 ```
 
 ## Run tests
@@ -209,13 +209,13 @@ D:/anaconda/envs/pytorch/python.exe main.py
 ### Core + generator + GUI smoke
 
 ```bash
-D:/anaconda/envs/pytorch/python.exe -m pytest tests/test_connection_engine.py tests/test_verilog_generator.py tests/test_gui_smoke.py -v
+<path-to-your-python>/python.exe -m pytest tests/test_connection_engine.py tests/test_verilog_generator.py tests/test_gui_smoke.py -v
 ```
 
 ### Full suite
 
 ```bash
-D:/anaconda/envs/pytorch/python.exe -m pytest tests -v
+<path-to-your-python>/python.exe -m pytest tests -v
 ```
 
 ## How to use the project now
@@ -225,7 +225,7 @@ D:/anaconda/envs/pytorch/python.exe -m pytest tests -v
 Run:
 
 ```bash
-D:/anaconda/envs/pytorch/python.exe main.py
+<path-to-your-python>/python.exe main.py
 ```
 
 ### Step 2: import Verilog files
